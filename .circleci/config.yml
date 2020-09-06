@@ -3,6 +3,24 @@
 version: 2
 
 jobs:
+  cargotest:
+    docker:
+      - image: cimg/rust:1.46.0
+    steps:
+      - checkout
+      - run:
+          name: Version information
+          command: rustc --version; cargo --version; rustup --version
+      - run:
+          name: Calculate dependencies
+          command: cargo generate-lockfile
+      - restore_cache:
+          keys:
+            - v4-cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
+      - run:
+          name: Run all tests
+          command: cargo test --all --all-targets -- --test-threads=1
+
   cargobuild:
     docker:
       - image: cimg/rust:1.46.0
@@ -59,3 +77,4 @@ workflows:
     jobs:
       - cargofmt
       - cargobuild
+      - cargotest
