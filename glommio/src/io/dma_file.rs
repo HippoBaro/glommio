@@ -299,7 +299,7 @@ impl DmaFile {
         max_read_amp: Option<usize>,
     ) -> ReadManyResult<V, impl Stream<Item = (ScheduledSource, ReadManyArgs<V>)>>
     where
-        V: IoVec + Unpin,
+        V: IoVec,
         S: Stream<Item = V> + Unpin,
     {
         let file = self.clone();
