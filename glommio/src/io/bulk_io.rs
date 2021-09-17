@@ -34,6 +34,8 @@ impl IoVec for (u64, usize) {
 
 pub(crate) struct MergedIOVecs<V: IoVec>(pub(crate) VecDeque<V>, pub(crate) (u64, usize));
 
+impl<V: IoVec> Unpin for MergedIOVecs<V> {}
+
 impl<V: IoVec> MergedIOVecs<V> {
     fn deduplicate(&mut self, mut other: Self) -> Option<Self> {
         if self.1 == other.1 {
@@ -68,6 +70,8 @@ struct IOVecMerger<V: IoVec> {
     current: Option<(u64, usize)>,
     merged: VecDeque<V>,
 }
+
+impl<V: IoVec> Unpin for IOVecMerger<V> {}
 
 impl<V: IoVec> IOVecMerger<V> {
     pub(super) fn merge(&mut self, io: V) -> Option<MergedIOVecs<V>> {
@@ -113,7 +117,7 @@ impl<V: IoVec> IOVecMerger<V> {
     }
 }
 
-pub(crate) struct CoalescedReads<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> {
+pub(crate) struct CoalescedReads<V: IoVec, S: Stream<Item = V> + Unpin> {
     iter: S,
     merger: Option<IOVecMerger<V>>,
     alignment: Option<u64>,
@@ -121,7 +125,7 @@ pub(crate) struct CoalescedReads<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> 
     last: Option<MergedIOVecs<V>>,
 }
 
-impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> CoalescedReads<V, S> {
+impl<V: IoVec, S: Stream<Item = V> + Unpin> CoalescedReads<V, S> {
     pub(crate) fn new(
         max_merged_buffer_size: usize,
         max_read_amp: Option<usize>,
@@ -142,7 +146,7 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> CoalescedReads<V, S> {
     }
 }
 
-impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V, S> {
+impl<V: IoVec, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V, S> {
     // CoalescedReads returns the original (offset, size) and the (offset, size) it
     // was merged in
     type Item = MergedIOVecs<V>;
@@ -203,7 +207,7 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
 }
 
 #[derive(Debug)]
-pub(crate) struct OrderedBulkIo<U: Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> {
+pub(crate) struct OrderedBulkIo<U, S: Stream<Item = (ScheduledSource, U)> + Unpin> {
     file: Rc<DmaFile>,
     iovs: S,
 
@@ -212,7 +216,9 @@ pub(crate) struct OrderedBulkIo<U: Unpin, S: Stream<Item = (ScheduledSource, U)>
     terminated: bool,
 }
 
-impl<U: Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBulkIo<U, S> {
+impl<U, S: Stream<Item = (ScheduledSource, U)> + Unpin> Unpin for OrderedBulkIo<U, S> {}
+
+impl<U, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBulkIo<U, S> {
     pub(crate) fn new(file: Rc<DmaFile>, concurrency: usize, iovs: S) -> OrderedBulkIo<U, S> {
         assert!(concurrency > 0);
         OrderedBulkIo {
@@ -225,7 +231,7 @@ impl<U: Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBulkIo<U, 
     }
 }
 
-impl<U: Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream for OrderedBulkIo<U, S> {
+impl<U, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream for OrderedBulkIo<U, S> {
     type Item = (ScheduledSource, U);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -289,24 +295,23 @@ impl<U: Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream for Ordere
 }
 
 #[derive(Debug, Clone)]
-pub struct ReadManyArgs<V: IoVec + Unpin> {
+pub struct ReadManyArgs<V: IoVec> {
     pub(crate) user_reads: VecDeque<V>,
     pub(crate) system_read: (u64, usize),
 }
+
+impl<V: IoVec> Unpin for ReadManyArgs<V> {}
 
 /// A stream of ReadResult produced asynchronously.
 ///
 /// See [`DmaFile::read_many`] for more information
 #[derive(Debug)]
-pub struct ReadManyResult<
-    V: IoVec + Unpin,
-    S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Unpin,
-> {
+pub struct ReadManyResult<V: IoVec, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Unpin> {
     pub(crate) inner: OrderedBulkIo<ReadManyArgs<V>, S>,
     pub(crate) current: Option<(ScheduledSource, ReadManyArgs<V>)>,
 }
 
-impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Unpin> Stream
+impl<V: IoVec, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Unpin> Stream
     for ReadManyResult<V, S>
 {
     type Item = super::Result<(V, ReadResult)>;

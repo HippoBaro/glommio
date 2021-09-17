@@ -292,7 +292,7 @@ impl DmaFile {
     ///
     /// It is not necessary to respect the `O_DIRECT` alignment of the file, and
     /// this API will internally convert the positions and sizes to match.
-    pub fn read_many<V: IoVec + Unpin, S: Stream<Item = V> + Unpin>(
+    pub fn read_many<V: IoVec, S: Stream<Item = V> + Unpin>(
         self: &Rc<DmaFile>,
         iovs: S,
         max_merged_buffer_size: usize,
