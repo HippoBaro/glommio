@@ -52,6 +52,7 @@ cc = "1.0.47"
 [features]
 bench = []
 debugging = []
+stall-detection = []
 
 [[bench]]
 name = "executor"
