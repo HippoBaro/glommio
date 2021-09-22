@@ -37,6 +37,8 @@ lockfree = "0.5"
 membarrier = "0.2.2"
 tracing = "0.1"
 crossbeam = "0.8"
+signal-hook = { version = "0.3.10", optional = true }
+backtrace = { version = "0.3.61", optional = true }
 
 [dev-dependencies]
 futures = "0.3.5"
@@ -45,6 +47,7 @@ tokio = { version = "0.3.5", default-features = false, features = ["rt", "macros
 rand = "0.8.0"
 tracing-subscriber = "0.2"
 pretty_env_logger = "0.4"
+logtest = "2.0.0"
 
 [build-dependencies]
 cc = "1.0.47"
@@ -52,7 +55,7 @@ cc = "1.0.47"
 [features]
 bench = []
 debugging = []
-stall-detection = []
+stall-detection = ["signal-hook", "backtrace"]
 
 [[bench]]
 name = "executor"

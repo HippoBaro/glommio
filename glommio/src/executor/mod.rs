@@ -32,6 +32,7 @@
 mod latch;
 mod multitask;
 mod placement;
+mod stall;
 
 use latch::{Latch, LatchState};
 pub use placement::{CpuSet, Placement};
@@ -56,6 +57,8 @@ use scoped_tls::scoped_thread_local;
 
 use log::warn;
 
+#[cfg(feature = "stall-detection")]
+use crate::executor::stall::StallDetector;
 use crate::{
     error::BuilderErrorKind,
     parking,
@@ -855,6 +858,9 @@ pub struct LocalExecutor {
     parker: parking::Parker,
     id: usize,
     reactor: Rc<parking::Reactor>,
+
+    #[cfg(feature = "stall-detection")]
+    stall_detector: StallDetector,
 }
 
 impl LocalExecutor {
@@ -896,12 +902,15 @@ impl LocalExecutor {
         }
         let p = parking::Parker::new();
         let queues = ExecutorQueues::new(preempt_timer, spin_before_park);
-        trace!(id = notifier.id(), "Creating executor");
+        let exec_id = notifier.id();
+        trace!(id = exec_id, "Creating executor");
         Ok(LocalExecutor {
             queues: Rc::new(RefCell::new(queues)),
             parker: p,
-            id: notifier.id(),
+            id: exec_id,
             reactor: Rc::new(parking::Reactor::new(notifier, io_memory)),
+            #[cfg(feature = "stall-detection")]
+            stall_detector: StallDetector::new(exec_id)?,
         })
     }
 
@@ -1055,43 +1064,38 @@ impl LocalExecutor {
                     now
                 };
 
-                let mut tasks_executed_this_loop = 0;
-                loop {
-                    let mut queue_ref = queue.borrow_mut();
-                    if self.need_preempt() || queue_ref.yielded() {
-                        break;
-                    }
+                let (runtime, tasks_executed_this_loop) = {
+                    #[cfg(feature = "stall-detection")]
+                    let _stall_detector_guard = self
+                        .stall_detector
+                        .enter_task_queue(
+                            queue.borrow_mut().name.clone(),
+                            time,
+                            self.preempt_timer_duration(),
+                        )
+                        .unwrap();
 
-                    if let Some(r) = queue_ref.get_task() {
-                        drop(queue_ref);
-                        r.run();
-                        tasks_executed_this_loop += 1;
-                    } else {
-                        break;
-                    }
-                }
+                    let mut tasks_executed_this_loop = 0;
+                    loop {
+                        let mut queue_ref = queue.borrow_mut();
+                        if self.need_preempt() || queue_ref.yielded() {
+                            break;
+                        }
 
-                let runtime = time.elapsed();
-
-                let (need_repush, last_vruntime) = {
-                    let mut state = queue.borrow_mut();
-
-                    if cfg!(feature = "stall-detection") {
-                        // we consider a queue to be stalling the system if it returned more than a
-                        // millisecond after it should have. i.e. a task queue has 1ms after
-                        // `need_preempt()`returns true to yield.
-                        let stall_threshold = self
-                            .preempt_timer_duration()
-                            .saturating_add(Duration::from_millis(1))
-                            .max(Duration::from_millis(5));
-                        if runtime > stall_threshold {
-                            warn!(
-                                "Reactor stall! {} : {} {:?} > {:?}",
-                                &self.id, &state.name, runtime, stall_threshold
-                            );
+                        if let Some(r) = queue_ref.get_task() {
+                            drop(queue_ref);
+                            r.run();
+                            tasks_executed_this_loop += 1;
+                        } else {
+                            break;
                         }
                     }
 
+                    (time.elapsed(), tasks_executed_this_loop)
+                };
+
+                let (need_repush, last_vruntime) = {
+                    let mut state = queue.borrow_mut();
                     let last_vruntime = state.account_vruntime(runtime);
                     (state.is_active(), last_vruntime)
                 };
