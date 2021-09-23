@@ -46,6 +46,7 @@ use crate::{
 };
 use ahash::AHashMap;
 use nix::sys::socket::{MsgFlags, SockAddr};
+use skiplist::ordered_skiplist::OrderedSkipList;
 use smallvec::SmallVec;
 use std::{
     cell::RefCell,
@@ -132,6 +133,46 @@ impl Inner {
     }
 }
 
+struct TimerNode {
+    deadline: Instant,
+    id: u64,
+    waker: Option<Waker>,
+}
+
+impl TimerNode {
+    fn new(deadline: Instant, id: u64, waker: Waker) -> Self {
+        Self {
+            deadline,
+            id,
+            waker: Some(waker),
+        }
+    }
+
+    fn key(deadline: Instant, id: u64) -> Self {
+        Self {
+            deadline,
+            id,
+            waker: None,
+        }
+    }
+}
+
+impl PartialOrd for TimerNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(
+            self.deadline
+                .cmp(&other.deadline)
+                .then(self.id.cmp(&other.id)),
+        )
+    }
+}
+
+impl PartialEq<Self> for TimerNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+
 struct Timers {
     timer_id: u64,
     timers_by_id: AHashMap<u64, Instant>,
@@ -141,7 +182,8 @@ struct Timers {
     /// Timers are in the order in which they fire. The `usize` in this type is
     /// a timer ID used to distinguish timers that fire at the same time.
     /// The `Waker` represents the task awaiting the timer.
-    timers: BTreeMap<(Instant, u64), Waker>,
+    // timers: BTreeMap<(Instant, u64), Waker>,
+    timers: OrderedSkipList<TimerNode>,
 }
 
 impl Timers {
@@ -149,7 +191,7 @@ impl Timers {
         Timers {
             timer_id: 0,
             timers_by_id: AHashMap::new(),
-            timers: BTreeMap::new(),
+            timers: OrderedSkipList::new(),
         }
     }
 
@@ -160,7 +202,10 @@ impl Timers {
 
     fn remove(&mut self, id: u64) -> Option<Waker> {
         if let Some(when) = self.timers_by_id.remove(&id) {
-            return self.timers.remove(&(when, id));
+            return self
+                .timers
+                .remove(&TimerNode::key(when, id))
+                .map(|x| x.waker.unwrap());
         }
 
         None
@@ -168,39 +213,31 @@ impl Timers {
 
     fn insert(&mut self, id: u64, when: Instant, waker: Waker) {
         if let Some(when) = self.timers_by_id.get_mut(&id) {
-            self.timers.remove(&(*when, id));
+            self.timers.remove(&TimerNode::key(*when, id));
         }
         self.timers_by_id.insert(id, when);
-        self.timers.insert((when, id), waker);
+        self.timers.insert(TimerNode::new(when, id, waker));
     }
 
     /// Return the duration until next event and the number of
     /// ready and woke timers.
     fn process_timers(&mut self) -> (Option<Duration>, usize) {
         let now = Instant::now();
+        let mut woke = 0usize;
 
-        // Split timers into ready and pending timers.
-        let pending = self.timers.split_off(&(now, 0));
-        let ready = mem::replace(&mut self.timers, pending);
-
-        // Calculate the duration until the next event.
-        let dur = if ready.is_empty() {
-            // Duration until the next timer.
-            self.timers
-                .keys()
-                .next()
-                .map(|(when, _)| when.saturating_duration_since(now))
-        } else {
-            // Timers are about to fire right now.
-            Some(Duration::from_secs(0))
-        };
-
-        let woke = ready.len();
-        for (_, waker) in ready {
-            wake!(waker);
+        while let Some(next) = self.timers.front() {
+            if next.deadline <= now {
+                let next = self.timers.pop_front().unwrap();
+                woke += 1;
+                wake!(next.waker.unwrap());
+            } else if woke == 0 {
+                // Calculate the duration until the next event.
+                return (Some(next.deadline.saturating_duration_since(now)), woke);
+            } else {
+                break;
+            }
         }
-
-        (dur, woke)
+        (Some(Duration::default()), woke)
     }
 }
 
