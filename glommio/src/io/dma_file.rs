@@ -309,9 +309,9 @@ impl DmaFile {
             let reactor = file.file.reactor.upgrade().unwrap();
             let fd = file.as_raw_fd();
             let pollable = file.pollable;
-            let scheduler = file.file.scheduler.borrow();
+            // let scheduler = file.file.scheduler.borrow();
             (
-                reactor.read_dma(fd, iov.1.0, iov.1.1, pollable, scheduler.as_ref()),
+                reactor.read_dma(fd, iov.1.0, iov.1.1, pollable, None),
                 ReadManyArgs {
                     user_reads: iov.0,
                     system_read: iov.1,
