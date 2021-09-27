@@ -116,10 +116,29 @@ impl LocalQueue {
 
 const MAX_UNFAIR_SCHEDULING: usize = 256;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TaskQueueState {
+    /// The queue contains scheduled, active tasks. An active queue should not
+    /// be dropped, and its tasks should be executed ASAP.
+    Active,
+    /// The queue contains scheduled reentrant tasks.  A reentrant queue should
+    /// not be dropped. Although the user intends the scheduler to schedule
+    /// these tasks _eventually_, it is not a priority.
+    FullyReentrant,
+    /// This queue contains no scheduled task and should be dropped.
+    Exhausted,
+}
+
 /// A single-threaded executor.
 #[derive(Debug)]
 pub(crate) struct LocalExecutor {
-    local_queue: LocalQueue,
+    /// A local queue of schedulable tasks
+    active_queue: LocalQueue,
+    /// A local queue of reentrant tasks that yielded control to the executor
+    /// before preemption was needed; i.e., they would like to get CPU time
+    /// _eventually_. Once a task enters this queue, the executor will not
+    /// execute them until its next iteration
+    reentrant_queue: LocalQueue,
 
     /// run_next, if present is a runnable that was scheduled by the previous
     /// task and should be run next instead of what's in the local queue.
@@ -152,7 +171,8 @@ impl LocalExecutor {
     /// Creates a new single-threaded executor.
     pub(crate) fn new() -> LocalExecutor {
         LocalExecutor {
-            local_queue: LocalQueue::new(),
+            active_queue: LocalQueue::new(),
+            reentrant_queue: LocalQueue::new(),
             run_next: RefCell::new(None),
             last_popped: RefCell::new(None),
             run_next_count: Cell::new(0),
@@ -174,7 +194,11 @@ impl LocalExecutor {
             let tq = tq.upgrade();
 
             if let Some(tq) = tq {
-                tq.borrow().ex.push_task(runnable);
+                {
+                    let tq = tq.borrow();
+                    tq.ex.push_task(runnable, tq.yielded);
+                }
+
                 maybe_activate(tq);
             }
         };
@@ -226,8 +250,8 @@ impl LocalExecutor {
             (Some(runnable), false) => {
                 // pop from the queue instead
                 self.run_next_count.replace(0);
-                Some(if let Some(ret) = self.local_queue.pop() {
-                    self.local_queue.push(runnable);
+                Some(if let Some(ret) = self.active_queue.pop() {
+                    self.active_queue.push(runnable);
                     ret
                 } else {
                     // there is nothing in the queue so run the priority runnable anyway
@@ -236,7 +260,7 @@ impl LocalExecutor {
             }
             (_, _) => {
                 self.run_next_count.replace(0);
-                self.local_queue.pop()
+                self.active_queue.pop()
             }
         };
 
@@ -244,45 +268,61 @@ impl LocalExecutor {
         ret
     }
 
-    /// Returns true if this [`LocalExecutor`] has some scheduled work
-    pub(crate) fn is_active(&self) -> bool {
-        !(self.local_queue.queue.borrow().is_empty() && self.run_next.borrow().is_none())
-    }
-
     /// Reset the state of this [`LocalExecutor`] to be fair wrt scheduling
-    /// decisions
-    pub(crate) fn make_fair(&self) {
-        // empty the priority slot so that we pick a task from the queue next time
+    /// decisions and return the state of the queue.
+    pub(crate) fn make_fair(&self) -> TaskQueueState {
+        let any_active =
+            !self.active_queue.queue.borrow().is_empty() || self.run_next.borrow().is_some();
+        let any_reentrant = !self.reentrant_queue.queue.borrow().is_empty();
+        let ret = match (any_active, any_reentrant) {
+            (true, _) => TaskQueueState::Active,
+            (false, true) => TaskQueueState::FullyReentrant,
+            (false, false) => TaskQueueState::Exhausted,
+        };
+
+        // If there is a task in the priority slot, put it in the back of the FIFO queue
         let _ = self.last_popped.borrow_mut().take();
         if let Some(runnable) = self.run_next.borrow_mut().take() {
-            self.local_queue.push(runnable)
+            self.active_queue.push(runnable)
         }
         self.run_next_count.replace(0);
+
+        // Put all the reentrant tasks at the back of the active queue such that we get
+        // to them next time the queue is polled.
+        self.active_queue
+            .queue
+            .borrow_mut()
+            .extend(self.reentrant_queue.queue.take());
+
+        ret
     }
 
     /// Schedule a given task for execution on this LocalExecutor
     /// If next is false, runnable is added to the tail of the runnable queue.
     /// If next is true, runnable is set as the immediate next task to run.
-    fn push_task(&self, runnable: Runnable) {
+    fn push_task(&self, runnable: Runnable, yielded: bool) {
         // Check whether the task we try to schedule is the same that's currently
         // running, if any. If so then the task is yielding voluntarily so we
         // put it at the tail of the queue
-        let reentrant = self
+        let mut reentrant = self
             .last_popped
             .borrow()
             .as_ref()
             .map_or(false, |last| *last == RunnableId::from(&runnable));
 
-        // if run_next is already populated, kick the runnable out into the regular
-        // queue
-        let runnable = if !reentrant {
-            self.run_next.borrow_mut().replace(runnable)
-        } else {
-            Some(runnable)
-        };
+        // If the task scheduled itself back because of preemption, we don't consider
+        // it reentrant (it likely has more work to do, and we want to get to it during
+        // this executor tick).
+        reentrant &= !yielded;
 
-        if let Some(runnable) = runnable {
-            self.local_queue.push(runnable)
+        if reentrant {
+            self.reentrant_queue.push(runnable)
+        } else {
+            // if run_next is already populated, kick the runnable out into the regular
+            // queue
+            if let Some(runnable) = self.run_next.borrow_mut().replace(runnable) {
+                self.active_queue.push(runnable)
+            }
         }
     }
 }
