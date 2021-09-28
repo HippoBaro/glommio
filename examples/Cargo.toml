@@ -12,7 +12,7 @@ ansi_term = "0.12.1"
 glommio = { path = "../glommio" }
 pretty-bytes = "0.2.2"
 clap = "2.33"
-sys-info = "0.7.0"
+sys-info = "0.8.0"
 fastrand = "1.4.0"
 num_cpus = "1.13.0"
 
