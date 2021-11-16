@@ -507,7 +507,12 @@ impl Reactor {
                     stats.file_buffered_bytes_read += *result as u64 * op_count;
                 }
             }),
-            reused: None,
+            reused: Some(|result, stats, op_count| {
+                if let Ok(result) = result {
+                    stats.file_buffered_deduped_reads += op_count;
+                    stats.file_buffered_deduped_bytes_read += *result as u64 * op_count;
+                }
+            }),
         };
 
         let source = self.new_source(
