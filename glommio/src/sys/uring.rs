@@ -612,6 +612,10 @@ impl UringQueueState {
             }),
         }
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.submissions.len()
+    }
 }
 
 pub(crate) trait ReactorRing {
@@ -631,6 +635,7 @@ trait UringCommon {
     /// up and `Some(false)` for not.
     fn consume_one_event(&mut self) -> Option<bool>;
     fn name(&self) -> &'static str;
+    fn inflight(&self) -> usize;
     fn registrar(&self) -> iou::Registrar<'_>;
 
     fn consume_sqe_queue(
@@ -775,6 +780,10 @@ impl UringCommon for PollRing {
         self.ring.registrar()
     }
 
+    fn inflight(&self) -> usize {
+        (self.submitted - self.completed) as usize
+    }
+
     fn needs_kernel_enter(&self) -> bool {
         // If we submitted anything, we will have the submission count differing from
         // the completion count and can_sleep will be false.
@@ -861,8 +870,10 @@ impl UringCommon for PollRing {
 struct SleepableRing {
     ring: iou::IoUring,
     size: usize,
+    submitted: u64,
+    completed: u64,
     submission_queue: ReactorQueue,
-    waiting_submission: usize,
+    waiting_kernel_submission: usize,
     name: &'static str,
     allocator: Rc<UringBufferAllocator>,
     stats: RingIoStats,
@@ -881,8 +892,10 @@ impl SleepableRing {
         Ok(SleepableRing {
             ring: iou::IoUring::new(size as _)?,
             size,
+            submitted: 0,
+            completed: 0,
             submission_queue: UringQueueState::with_capacity(size * 4, source_map.clone()),
-            waiting_submission: 0,
+            waiting_kernel_submission: 0,
             name,
             allocator,
             stats: RingIoStats::default(),
@@ -931,7 +944,7 @@ impl SleepableRing {
 
     fn install_eventfd(&mut self, eventfd_src: &Source) -> bool {
         if let Some(mut sqe) = self.ring.prepare_sqe() {
-            self.waiting_submission += 1;
+            self.waiting_kernel_submission += 1;
             // Now must wait on the `eventfd` in case someone wants to wake us up.
             // If we can't then we can't sleep and will just bail immediately
             let op = UringDescriptor {
@@ -978,7 +991,7 @@ impl SleepableRing {
 
     fn sleep(&mut self, link: &mut Source) -> io::Result<usize> {
         if let Some(mut sqe) = self.ring.prepare_sqe() {
-            self.waiting_submission += 1;
+            self.waiting_kernel_submission += 1;
 
             let op = UringDescriptor {
                 fd: link.raw(),
@@ -1025,8 +1038,14 @@ impl UringCommon for SleepableRing {
         self.ring.registrar()
     }
 
+    fn inflight(&self) -> usize {
+        self.submitted
+            .checked_sub(self.completed)
+            .unwrap_or_default() as usize
+    }
+
     fn needs_kernel_enter(&self) -> bool {
-        self.waiting_submission > 0
+        self.waiting_kernel_submission > 0
     }
 
     fn submission_queue(&mut self) -> ReactorQueue {
@@ -1035,7 +1054,7 @@ impl UringCommon for SleepableRing {
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
         let x = self.ring.submit_sqes()? as usize;
-        self.waiting_submission -= x;
+        self.waiting_kernel_submission -= x;
         Ok(x)
     }
 
@@ -1056,6 +1075,10 @@ impl UringCommon for SleepableRing {
             },
             source_map,
         )
+        .map(|x| {
+            self.completed += 1;
+            x
+        })
     }
 
     fn submit_one_event(&mut self, queue: &mut VecDeque<UringDescriptor>) -> Option<bool> {
@@ -1086,7 +1109,8 @@ impl UringCommon for SleepableRing {
 
         if let Some(sqes) = self.ring.prepare_sqes(chain_len as u32 + 1) {
             for mut sqe in sqes {
-                self.waiting_submission += 1;
+                self.submitted += 1;
+                self.waiting_kernel_submission += 1;
                 let op = queue.pop_front().unwrap();
                 let allocator = self.allocator.clone();
                 fill_sqe(
@@ -1498,6 +1522,49 @@ impl Reactor {
         Ok(())
     }
 
+    fn conditional_poll(
+        ring: &RefCell<dyn UringCommon>,
+        min_to_submit: usize,
+        max_inflight: usize,
+        woke: &mut usize,
+    ) -> io::Result<()> {
+        let mut ring = ring.borrow_mut();
+        let to_submit = ring.submission_queue().borrow().len();
+        if to_submit > min_to_submit && ring.inflight() < max_inflight {
+            ring.consume_submission_queue()?;
+            ring.consume_completion_queue(woke);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn maybe_rush_dispatch(
+        &self,
+        latency: Option<Latency>,
+        woke: &mut usize,
+    ) -> io::Result<()> {
+        match latency {
+            None => Self::conditional_poll(
+                &self.poll_ring,
+                self.rings_depth / 2,
+                self.rings_depth / 32,
+                woke,
+            ),
+            Some(Latency::NotImportant) => Self::conditional_poll(
+                &self.main_ring,
+                self.rings_depth / 2,
+                self.rings_depth / 32,
+                woke,
+            ),
+            Some(Latency::Matters(_)) => Self::conditional_poll(
+                &self.latency_ring,
+                self.rings_depth / 2,
+                self.rings_depth / 32,
+                woke,
+            ),
+        }
+    }
+
     fn simple_poll(ring: &RefCell<dyn UringCommon>, woke: &mut usize) -> io::Result<()> {
         let mut ring = ring.borrow_mut();
         ring.consume_submission_queue().or_else(Self::busy_ok)?;
@@ -1592,6 +1659,7 @@ impl Reactor {
         // we need to make sure we consume the latency ring before setting the
         // preemption timer because consuming this ring may wake up some previously
         // asleep task queues.
+        flush_rings!(lat_ring)?;
         consume_rings!(into &mut woke; lat_ring);
 
         // Cancel the old timer regardless of whether we can sleep:

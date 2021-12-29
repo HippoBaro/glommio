@@ -19,14 +19,16 @@ use std::{
 fn main() {
     let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
         .spawn(|| async move {
-            let filename = match std::env::var("GLOMMIO_TEST_POLLIO_ROOTDIR") {
-                Ok(path) => {
-                    let mut path = PathBuf::from(path);
-                    path.push("benchfile");
-                    path
-                }
-                Err(_) => panic!("please set 'GLOMMIO_TEST_POLLIO_ROOTDIR'"),
-            };
+            // let filename = match std::env::var("GLOMMIO_TEST_POLLIO_ROOTDIR") {
+            //     Ok(path) => {
+            //         let mut path = PathBuf::from(path);
+            //         path.push("benchfile");
+            //         path
+            //     }
+            //     Err(_) => panic!("please set 'GLOMMIO_TEST_POLLIO_ROOTDIR'"),
+            // };
+
+            let filename = PathBuf::from("/tmp/benchfile");
 
             {
                 let _ = std::fs::remove_file(&filename);

@@ -1156,7 +1156,8 @@ impl LocalExecutor {
                     now
                 };
 
-                let mut tasks_executed_this_loop = 0;
+                let mut tasks_executed_in_this_queue = 0;
+                let mut tasks_executed_in_this_loop = 0;
                 loop {
                     let mut queue_ref = queue.borrow_mut();
                     if self.need_preempt() || queue_ref.yielded() {
@@ -1166,7 +1167,20 @@ impl LocalExecutor {
                     if let Some(r) = queue_ref.get_task() {
                         drop(queue_ref);
                         r.run();
-                        tasks_executed_this_loop += 1;
+                        tasks_executed_in_this_queue += 1;
+                        tasks_executed_in_this_loop += 1;
+                    } else if tasks_executed_in_this_loop > 0 {
+                        drop(queue_ref);
+                        let _ = self.reactor.sys.maybe_rush_dispatch(
+                            Some(self.reactor.io_scheduler().requirements().latency_req),
+                            &mut 0,
+                        );
+
+                        if self.need_preempt_check_timer() {
+                            break;
+                        }
+
+                        tasks_executed_in_this_loop = 0;
                     } else {
                         break;
                     }
@@ -1183,7 +1197,7 @@ impl LocalExecutor {
                 let mut tq = self.queues.borrow_mut();
                 tq.active_executing = None;
                 tq.stats.executor_runtime += runtime;
-                tq.stats.tasks_executed += tasks_executed_this_loop;
+                tq.stats.tasks_executed += tasks_executed_in_this_queue;
 
                 tq.last_vruntime = match last_vruntime {
                     Some(x) => x,
