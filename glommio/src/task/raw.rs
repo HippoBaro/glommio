@@ -566,11 +566,16 @@ where
                     // was running, so now it's our responsibility to do so.
                     RawTask::<F, R, S>::drop_future(ptr);
 
-                    // Notify the awaiter that the future has been dropped.
-                    (*(raw.header as *mut Header)).notify(None);
+                    // Take the awaiter out.
+                    let awaiter = (*(raw.header as *mut Header)).take(None);
 
                     // Drop the task reference.
                     RawTask::<F, R, S>::drop_task(ptr);
+
+                    // Notify the awaiter that the future has been dropped.
+                    if let Some(w) = awaiter {
+                        abort_on_panic(|| w.wake());
+                    }
                 }
             }
         }

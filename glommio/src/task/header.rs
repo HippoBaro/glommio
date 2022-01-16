@@ -70,17 +70,30 @@ impl Header {
     /// notified.
     #[inline]
     pub(crate) fn notify(&mut self, current: Option<&Waker>) {
+        if let Some(w) = self.take(current) {
+            abort_on_panic(|| w.wake());
+        }
+    }
+
+    /// Takes the awaiter blocked on this task.
+    ///
+    /// If there is no awaiter or if it is the same as the current waker,
+    /// returns `None`.
+    #[inline]
+    pub(crate) fn take(&mut self, current: Option<&Waker>) -> Option<Waker> {
         // Take the waker out.
         let waker = self.awaiter.take();
 
+        // Finally, notify the waker if it's different from the current waker.
         if let Some(w) = waker {
-            // We need a safeguard against panics because waking can panic.
-            abort_on_panic(|| match current {
-                None => w.wake(),
-                Some(c) if !w.will_wake(c) => w.wake(),
-                Some(_) => {}
-            });
+            match current {
+                None => return Some(w),
+                Some(c) if !w.will_wake(c) => return Some(w),
+                Some(_) => abort_on_panic(|| drop(w)),
+            }
         }
+
+        None
     }
 
     /// Registers a new awaiter blocked on this task.
