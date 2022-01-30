@@ -179,6 +179,7 @@ pub(crate) fn sendmsg_syscall(
     syscall!(sendmsg(fd, &hdr, flags)).map(|x| x as usize)
 }
 
+mod buffer;
 mod dma_buffer;
 pub(crate) mod source;
 mod source_map;

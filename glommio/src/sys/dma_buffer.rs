@@ -10,7 +10,7 @@
 
 use std::ptr;
 
-use crate::sys::uring::UringBuffer;
+use crate::sys::buffer::UringBuffer;
 use alloc::alloc::Layout;
 
 #[derive(Debug)]
