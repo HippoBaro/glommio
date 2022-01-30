@@ -323,6 +323,7 @@ impl Source {
 impl Drop for Source {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
+        inner.wakers.waiters.clear();
         let enqueued = inner.enqueued.as_mut();
         if let Some(EnqueuedSource { id, queue, status }) = enqueued {
             match status {
