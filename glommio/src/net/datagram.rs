@@ -74,7 +74,7 @@ impl<S: AsRawFd + FromRawFd + From<socket2::Socket>> GlommioDatagram<S> {
     async fn consume_receive_buffer(&self, source: Source, buf: &mut [u8]) -> io::Result<usize> {
         let sz = source.collect_rw().await?;
         let src = match source.extract_source_type() {
-            SourceType::SockRecv(mut buf) => {
+            SourceType::SockRecv(_, mut buf, _) => {
                 let mut buf = buf.take().unwrap();
                 buf.trim_to_size(sz);
                 buf
@@ -133,7 +133,7 @@ impl<S: AsRawFd + FromRawFd + From<socket2::Socket>> GlommioDatagram<S> {
         )?;
         let sz = source.collect_rw().await?;
         match source.extract_source_type() {
-            SourceType::SockRecvMsg(mut src, _iov, hdr, addr) => {
+            SourceType::SockRecvMsg(_, mut src, _, _iov, hdr, addr) => {
                 let mut src = src.take().unwrap();
                 src.trim_to_size(sz);
                 buf[0..sz].copy_from_slice(&src.as_bytes()[0..sz]);

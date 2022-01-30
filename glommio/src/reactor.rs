@@ -24,7 +24,14 @@ use std::{
 };
 
 use ahash::AHashMap;
-use nix::sys::socket::{MsgFlags, SockAddr};
+use libc::mode_t;
+use nix::{
+    fcntl::{FallocateFlags, OFlag},
+    sys::{
+        socket::{MsgFlags, SockAddr},
+        stat::Mode,
+    },
+};
 use smallvec::SmallVec;
 
 use crate::{
@@ -34,6 +41,7 @@ use crate::{
         self,
         common_flags,
         read_flags,
+        write_flags,
         DirectIo,
         DmaBuffer,
         IoBuffer,
@@ -48,7 +56,6 @@ use crate::{
     PoolPlacement,
     TaskQueueHandle,
 };
-use nix::poll::PollFlags;
 
 type SharedChannelWakerChecker = (SmallVec<[Waker; 1]>, Option<Box<dyn Fn() -> usize>>);
 
@@ -304,7 +311,7 @@ impl Reactor {
 
         let source = self.new_source(
             raw,
-            SourceType::Write(pollable, IoBuffer::Dma(buf)),
+            SourceType::Write(pos, pollable, IoBuffer::Dma(buf)),
             Some(stats),
         );
         self.sys.write_dma(&source, pos);
@@ -326,6 +333,7 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Write(
+                pos,
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Buffered(buf),
             ),
@@ -356,15 +364,18 @@ impl Reactor {
     }
 
     pub(crate) fn poll_read_ready(&self, fd: RawFd) -> Source {
-        let source = self.new_source(fd, SourceType::PollAdd, None);
+        let source = self.new_source(fd, SourceType::PollAdd(common_flags() | read_flags()), None);
         self.sys.poll_ready(&source, common_flags() | read_flags());
         source
     }
 
     pub(crate) fn poll_write_ready(&self, fd: RawFd) -> Source {
-        let source = self.new_source(fd, SourceType::PollAdd, None);
-        self.sys
-            .poll_ready(&source, common_flags() | PollFlags::POLLOUT);
+        let source = self.new_source(
+            fd,
+            SourceType::PollAdd(common_flags() | write_flags()),
+            None,
+        );
+        self.sys.poll_ready(&source, common_flags() | write_flags());
         source
     }
 
@@ -374,7 +385,7 @@ impl Reactor {
         buf: DmaBuffer,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
-        let source = self.new_source(fd, SourceType::SockSend(buf), None);
+        let source = self.new_source(fd, SourceType::SockSend(buf, MsgFlags::empty()), None);
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
@@ -406,7 +417,11 @@ impl Reactor {
             msg_flags: 0,
         };
 
-        let source = self.new_source(fd, SourceType::SockSendMsg(buf, iov, hdr, addr), None);
+        let source = self.new_source(
+            fd,
+            SourceType::SockSendMsg(buf, MsgFlags::empty(), iov, hdr, addr),
+            None,
+        );
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
@@ -439,7 +454,9 @@ impl Reactor {
         let source = self.new_source(
             fd,
             SourceType::SockRecvMsg(
+                size,
                 None,
+                flags,
                 iov,
                 hdr,
                 std::mem::MaybeUninit::<nix::sys::socket::sockaddr_storage>::uninit(),
@@ -460,7 +477,11 @@ impl Reactor {
         size: usize,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
-        let source = self.new_source(fd, SourceType::SockRecv(None), None);
+        let source = self.new_source(
+            fd,
+            SourceType::SockRecv(size, None, MsgFlags::empty()),
+            None,
+        );
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
@@ -470,7 +491,7 @@ impl Reactor {
     }
 
     pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: MsgFlags) -> Source {
-        let source = self.new_source(fd, SourceType::SockRecv(None), None);
+        let source = self.new_source(fd, SourceType::SockRecv(size, None, flags), None);
         self.sys.recv(&source, size, flags);
         source
     }
@@ -511,7 +532,11 @@ impl Reactor {
             },
         };
 
-        let source = self.new_source(raw, SourceType::Read(pollable, None), Some(stats));
+        let source = self.new_source(
+            raw,
+            SourceType::Read(pos, size, pollable, None),
+            Some(stats),
+        );
 
         if let Some(scheduler) = scheduler {
             if let Some(source) =
@@ -560,7 +585,12 @@ impl Reactor {
 
         let source = self.new_source(
             raw,
-            SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
+            SourceType::Read(
+                pos,
+                size,
+                PollableStatus::NonPollable(DirectIo::Disabled),
+                None,
+            ),
             Some(stats),
         );
 
@@ -592,13 +622,21 @@ impl Reactor {
         size: u64,
         flags: libc::c_int,
     ) -> Source {
-        let source = self.new_source(raw, SourceType::Fallocate, None);
+        let source = self.new_source(
+            raw,
+            SourceType::Fallocate(
+                position,
+                size as usize,
+                FallocateFlags::from_bits_truncate(flags),
+            ),
+            None,
+        );
         self.sys.fallocate(&source, position, size, flags);
         source
     }
 
     pub(crate) fn truncate(&self, raw: RawFd, size: u64) -> Source {
-        let source = self.new_source(raw, SourceType::Truncate, None);
+        let source = self.new_source(raw, SourceType::Truncate(size as usize), None);
         self.sys.truncate(&source, size);
         source
     }
@@ -624,7 +662,14 @@ impl Reactor {
     }
 
     pub(crate) fn create_dir<P: AsRef<Path>>(&self, path: P, mode: libc::c_int) -> Source {
-        let source = self.new_source(-1, SourceType::CreateDir(path.as_ref().to_owned()), None);
+        let source = self.new_source(
+            -1,
+            SourceType::CreateDir(
+                path.as_ref().to_owned(),
+                Mode::from_bits_truncate(mode as mode_t),
+            ),
+            None,
+        );
         self.sys.create_dir(&source, mode);
         source
     }
@@ -681,7 +726,11 @@ impl Reactor {
 
         let source = self.new_source(
             dir,
-            SourceType::Open(path),
+            SourceType::Open(
+                path,
+                OFlag::from_bits_truncate(flags),
+                Mode::from_bits_truncate(mode),
+            ),
             Some(StatsCollection {
                 fulfilled: Some(|result, stats, op_count| {
                     if result.is_ok() {

@@ -1,13 +1,6 @@
 use crate::{
     free_list::{FreeList, Idx},
-    sys::{
-        source::PinnedInnerSource,
-        EnqueuedSource,
-        EnqueuedStatus,
-        InnerSource,
-        ReactorQueue,
-        Source,
-    },
+    sys::{source::PinnedInnerSource, EnqueuedSource, EnqueuedStatus, InnerSource, ReactorQueue},
 };
 use std::cell::RefMut;
 
@@ -21,15 +14,15 @@ pub(super) fn to_user_data(id: SourceId) -> u64 {
 }
 
 impl SourceMap {
-    pub(super) fn add_source(&mut self, source: &Source, queue: ReactorQueue) -> SourceId {
-        let item = source.inner.clone();
-        let id = self.alloc(item);
-        let status = EnqueuedStatus::Enqueued;
-        source
-            .inner
-            .borrow_mut()
-            .enqueued
-            .replace(EnqueuedSource { id, queue, status });
+    pub(super) fn add_source(&mut self, src: PinnedInnerSource, queue: ReactorQueue) -> SourceId {
+        let id = self.alloc(src);
+        self.peek_source_mut(id, |mut src| {
+            src.enqueued.replace(EnqueuedSource {
+                id,
+                queue,
+                status: EnqueuedStatus::Enqueued,
+            });
+        });
         id
     }
 

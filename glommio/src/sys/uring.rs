@@ -10,7 +10,7 @@ use nix::{
 };
 use rlimit::Resource;
 use std::{
-    cell::{Cell, Ref, RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     collections::VecDeque,
     ffi::CStr,
     io,
@@ -187,7 +187,12 @@ fn fill_sqe<F>(
                         SourceType::ForeignNotifier(result, _) => {
                             sqe.prep_read(op.fd, result, pos);
                         }
-                        SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), slot) => {
+                        SourceType::Read(
+                            _,
+                            _,
+                            PollableStatus::NonPollable(DirectIo::Disabled),
+                            slot,
+                        ) => {
                             let mut buf = buffer_allocation(len).expect("Buffer allocation failed");
                             sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
                             // If you have a buffer here, that very likely means you are reusing the
@@ -248,11 +253,16 @@ fn fill_sqe<F>(
                 let mut buf = buffer_allocation(len).expect("Buffer allocation failed");
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
                     match &mut src.source_type {
-                        SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), slot) => {
+                        SourceType::Read(
+                            _,
+                            _,
+                            PollableStatus::NonPollable(DirectIo::Disabled),
+                            slot,
+                        ) => {
                             sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
                             *slot = Some(IoBuffer::Dma(buf));
                         }
-                        SourceType::Read(_, slot) => {
+                        SourceType::Read(_, _, _, slot) => {
                             match buf.uring_buffer_id() {
                                 None => {
                                     sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
@@ -300,7 +310,7 @@ fn fill_sqe<F>(
 
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
                     match &mut src.source_type {
-                        SourceType::SockRecv(slot) => {
+                        SourceType::SockRecv(_, slot, _) => {
                             *slot = Some(buf);
                         }
                         _ => unreachable!(),
@@ -312,7 +322,7 @@ fn fill_sqe<F>(
                 let mut buf = DmaBuffer::new(len).expect("failed to allocate buffer");
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
                     match &mut src.source_type {
-                        SourceType::SockRecvMsg(slot, iov, hdr, msg_name) => {
+                        SourceType::SockRecvMsg(_, slot, _, iov, hdr, msg_name) => {
                             iov.iov_base = buf.as_mut_ptr() as *mut libc::c_void;
                             iov.iov_len = len;
 
@@ -438,15 +448,13 @@ fn extract_one_chain(
         .collect()
 }
 
-fn process_one_event<F, R>(
+fn process_one_event<R>(
     cqe: Option<iou::CQE>,
-    try_process: F,
     post_process: R,
     source_map: Rc<RefCell<SourceMap>>,
 ) -> Option<bool>
 where
-    F: FnOnce(Ref<'_, InnerSource>) -> Option<()>,
-    R: FnOnce(RefMut<'_, InnerSource>, io::Result<usize>) -> io::Result<usize>,
+    R: FnOnce(&'_ mut InnerSource, io::Result<usize>) -> io::Result<usize>,
 {
     if let Some(value) = cqe {
         // No user data is `POLL_REMOVE` or `CANCEL`, we won't process.
@@ -458,16 +466,12 @@ where
             .borrow_mut()
             .consume_source(from_user_data(value.user_data()));
 
-        let result = value.result();
-
-        let mut woke = false;
-        if try_process(src.borrow()).is_none() {
-            let res = Some(post_process(src.borrow_mut(), transmute_error(result)));
-            let mut inner_source = src.borrow_mut();
-            inner_source.wakers.result = res;
-            woke = inner_source.wakers.wake_waiters();
-        }
-        return Some(woke);
+        let mut inner_source = src.borrow_mut();
+        inner_source.wakers.result = Some(post_process(
+            &mut *inner_source,
+            transmute_error(value.result()),
+        ));
+        return Some(inner_source.wakers.wake_waiters());
     }
     None
 }
@@ -737,9 +741,8 @@ impl UringCommon for PollRing {
         let source_map = self.source_map.clone();
         process_one_event(
             self.ring.peek_for_cqe(),
-            |_| None,
-            |mut src, res| {
-                record_stats(self, &mut src, &res);
+            |src, res| {
+                record_stats(self, src, &res);
                 res
             },
             source_map,
@@ -850,7 +853,7 @@ impl SleepableRing {
                 user_data: to_user_data(
                     self.source_map
                         .borrow_mut()
-                        .add_source(&source, self.submission_queue.clone()),
+                        .add_source(source.inner.clone(), self.submission_queue.clone()),
                 ),
             });
         source
@@ -893,7 +896,7 @@ impl SleepableRing {
             user_data: to_user_data(
                 self.source_map
                     .borrow_mut()
-                    .add_source(&timer_source, queue.clone()),
+                    .add_source(timer_source.inner.clone(), queue.clone()),
             ),
         });
         timer_source
@@ -909,7 +912,7 @@ impl SleepableRing {
                 user_data: to_user_data(
                     self.source_map
                         .borrow_mut()
-                        .add_source(eventfd_src, self.submission_queue.clone()),
+                        .add_source(eventfd_src.inner.clone(), self.submission_queue.clone()),
                 ),
                 args: UringOpDescriptor::Read(0, 8),
             };
@@ -959,7 +962,7 @@ impl SleepableRing {
                 user_data: to_user_data(
                     self.source_map
                         .borrow_mut()
-                        .add_source(link, self.submission_queue.clone()),
+                        .add_source(link.inner.clone(), self.submission_queue.clone()),
                 ),
                 args: UringOpDescriptor::PollAdd(common_flags() | read_flags()),
             };
@@ -1067,12 +1070,8 @@ impl UringCommon for SleepableRing {
         let source_map = self.source_map.clone();
         process_one_event(
             self.ring.peek_for_cqe(),
-            |source| match source.source_type {
-                SourceType::LinkRings => Some(()),
-                _ => None,
-            },
-            |mut src, res| {
-                record_stats(self, &mut src, &res);
+            |src, res| {
+                record_stats(self, src, &res);
                 if let SourceType::ForeignNotifier(_, installed) = &mut src.source_type {
                     *installed = false;
                 }
@@ -1152,6 +1151,11 @@ pub(crate) fn common_flags() -> PollFlags {
 /// Epoll flags for all possible readability events.
 pub(crate) fn read_flags() -> PollFlags {
     PollFlags::POLLIN | PollFlags::POLLPRI
+}
+
+/// Epoll flags for all possible writability events.
+pub(crate) fn write_flags() -> PollFlags {
+    PollFlags::POLLOUT
 }
 
 macro_rules! consume_rings {
@@ -1328,10 +1332,11 @@ impl Reactor {
     pub(crate) fn write_dma(&self, source: &Source, pos: u64) {
         let op = match &*source.source_type() {
             SourceType::Write(
+                _,
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Dma(buf),
             ) => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
-            SourceType::Write(_, IoBuffer::Dma(buf)) => match buf.uring_buffer_id() {
+            SourceType::Write(_, _, IoBuffer::Dma(buf)) => match buf.uring_buffer_id() {
                 Some(id) => UringOpDescriptor::WriteFixed(buf.as_ptr(), buf.len(), pos, id),
                 None => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
             },
@@ -1348,6 +1353,7 @@ impl Reactor {
     pub(crate) fn write_buffered(&self, source: &Source, pos: u64) {
         let op = match &*source.source_type() {
             SourceType::Write(
+                _,
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Buffered(buf),
             ) => UringOpDescriptor::Write(buf.as_ptr() as *const u8, buf.len(), pos),
@@ -1393,7 +1399,7 @@ impl Reactor {
 
     pub(crate) fn send(&self, source: &Source, flags: MsgFlags) {
         let op = match &*source.source_type() {
-            SourceType::SockSend(buf) => {
+            SourceType::SockSend(buf, _) => {
                 UringOpDescriptor::SockSend(buf.as_ptr() as *const u8, buf.len(), flags.bits())
             }
             _ => unreachable!(),
@@ -1408,7 +1414,7 @@ impl Reactor {
 
     pub(crate) fn sendmsg(&self, source: &Source, flags: MsgFlags) {
         let op = match &mut *source.source_type_mut() {
-            SourceType::SockSendMsg(_, iov, hdr, addr) => {
+            SourceType::SockSendMsg(_, _, iov, hdr, addr) => {
                 let (msg_name, msg_namelen) = addr.as_ffi_pair();
                 let msg_name = msg_name as *const nix::sys::socket::sockaddr as *mut libc::c_void;
 
@@ -1517,7 +1523,7 @@ impl Reactor {
 
     pub(crate) fn create_dir(&self, source: &Source, mode: libc::c_int) {
         let path = match &*source.source_type() {
-            SourceType::CreateDir(p) => p.clone(),
+            SourceType::CreateDir(p, _) => p.clone(),
             _ => panic!("Unexpected source for rename operation"),
         };
 
@@ -1571,7 +1577,7 @@ impl Reactor {
 
     pub(crate) fn open_at(&self, source: &Source, flags: libc::c_int, mode: libc::mode_t) {
         let pathptr = match &*source.source_type() {
-            SourceType::Open(cstring) => cstring.as_c_str().as_ptr(),
+            SourceType::Open(cstring, _, _) => cstring.as_c_str().as_ptr(),
             _ => panic!("Wrong source type!"),
         };
         let op = UringOpDescriptor::Open(pathptr as _, flags, mode as _);
@@ -1845,12 +1851,12 @@ impl Reactor {
         // because the more request we issue there, the less effective it becomes.
 
         match &*source.source_type() {
-            SourceType::Read(p, _) | SourceType::Write(p, _) => match p {
+            SourceType::Read(_, _, p, _) | SourceType::Write(_, p, _) => match p {
                 PollableStatus::Pollable => self.poll_ring.borrow_mut(),
                 PollableStatus::NonPollable(_) => self.main_ring.borrow_mut(),
             },
-            SourceType::SockRecv(_)
-            | SourceType::SockRecvMsg(_, _, _, _)
+            SourceType::SockRecv(_, _, _)
+            | SourceType::SockRecvMsg(_, _, _, _, _, _)
             | SourceType::Accept(_)
             | SourceType::Connect(_) => self.latency_ring.borrow_mut(),
             SourceType::Invalid => {
@@ -1908,7 +1914,7 @@ fn queue_request_into_ring(
 ) {
     source.inner.borrow_mut().wakers.queued_at = Some(Instant::now());
     let q = ring.submission_queue();
-    let id = source_map.add_source(source, Rc::clone(&q));
+    let id = source_map.add_source(source.inner.clone(), Rc::clone(&q));
 
     let flags = match &*source.timeout_ref() {
         Some(_) => SubmissionFlags::IO_LINK,

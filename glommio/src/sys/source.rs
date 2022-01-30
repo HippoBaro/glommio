@@ -1,3 +1,24 @@
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    convert::TryFrom,
+    ffi::CString,
+    fmt,
+    mem::MaybeUninit,
+    os::unix::io::RawFd,
+    path::PathBuf,
+    pin::Pin,
+    rc::Rc,
+    task::{Poll, Waker},
+    time::Duration,
+};
+
+use futures_lite::{future, io};
+use nix::{
+    fcntl::{FallocateFlags, OFlag},
+    poll::PollFlags,
+    sys::{socket::MsgFlags, stat::Mode},
+};
+
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the MIT/Apache-2.0 License, at your convenience
 //
@@ -21,44 +42,33 @@ use crate::{
     RingIoStats,
     TaskQueueHandle,
 };
-use futures_lite::{future, io};
-use std::{
-    cell::{Ref, RefCell, RefMut},
-    convert::TryFrom,
-    ffi::CString,
-    fmt,
-    mem::MaybeUninit,
-    os::unix::io::RawFd,
-    path::PathBuf,
-    pin::Pin,
-    rc::Rc,
-    task::{Poll, Waker},
-    time::Duration,
-};
 
 #[derive(Debug)]
 pub(crate) enum SourceType {
-    Write(PollableStatus, IoBuffer),
-    Read(PollableStatus, Option<IoBuffer>),
-    PollAdd,
-    SockSend(DmaBuffer),
-    SockRecv(Option<DmaBuffer>),
+    Write(u64, PollableStatus, IoBuffer),
+    Read(u64, usize, PollableStatus, Option<IoBuffer>),
+    PollAdd(PollFlags),
+    SockSend(DmaBuffer, MsgFlags),
+    SockRecv(usize, Option<DmaBuffer>, MsgFlags),
     SockRecvMsg(
+        usize,
         Option<DmaBuffer>,
+        MsgFlags,
         libc::iovec,
         libc::msghdr,
         MaybeUninit<nix::sys::socket::sockaddr_storage>,
     ),
     SockSendMsg(
         DmaBuffer,
+        MsgFlags,
         libc::iovec,
         libc::msghdr,
         nix::sys::socket::SockAddr,
     ),
-    Open(CString),
+    Open(CString, OFlag, Mode),
     FdataSync,
-    Fallocate,
-    Truncate,
+    Fallocate(u64, usize, FallocateFlags),
+    Truncate(usize),
     Close,
     LinkRings,
     ForeignNotifier(u64, bool),
@@ -67,7 +77,7 @@ pub(crate) enum SourceType {
     Connect(SockAddr),
     Accept(SockAddrStorage),
     Rename(PathBuf, PathBuf),
-    CreateDir(PathBuf),
+    CreateDir(PathBuf, Mode),
     Remove(PathBuf),
     BlockingFn,
     Invalid,
@@ -217,16 +227,16 @@ impl Source {
     pub(crate) fn extract_buffer(self) -> IoBuffer {
         let stype = self.extract_source_type();
         match stype {
-            SourceType::Read(_, Some(buffer)) => buffer,
-            SourceType::Write(_, buffer) => buffer,
+            SourceType::Read(_, _, _, Some(buffer)) => buffer,
+            SourceType::Write(_, _, buffer) => buffer,
             x => panic!("Could not extract buffer. Source: {:?}", x),
         }
     }
 
     pub(crate) fn buffer(&self) -> Ref<'_, IoBuffer> {
         Ref::map(self.source_type(), |stype| match &*stype {
-            SourceType::Read(_, Some(buffer)) => buffer,
-            SourceType::Write(_, buffer) => buffer,
+            SourceType::Read(_, _, _, Some(buffer)) => buffer,
+            SourceType::Write(_, _, buffer) => buffer,
             x => panic!("Could not extract buffer. Source: {:?}", x),
         })
     }
