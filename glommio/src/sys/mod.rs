@@ -181,6 +181,7 @@ pub(crate) fn sendmsg_syscall(
 
 mod dma_buffer;
 pub(crate) mod source;
+mod source_map;
 pub(crate) mod sysfs;
 mod uring;
 

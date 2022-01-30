@@ -26,16 +26,14 @@ use std::{
 };
 
 use crate::{
-    free_list::{FreeList, Idx},
     iou,
     iou::sqe::{FsyncFlags, SockAddrStorage, StatxFlags, StatxMode, SubmissionFlags, TimeoutFlags},
     sys::{
         self,
         blocking::{BlockingThreadOp, BlockingThreadPool},
         dma_buffer::{BufferStorage, DmaBuffer},
-        source::PinnedInnerSource,
+        source_map::{from_user_data, to_user_data, SourceId, SourceMap},
         DirectIo,
-        EnqueuedSource,
         EnqueuedStatus,
         InnerSource,
         IoBuffer,
@@ -587,43 +585,6 @@ where
         return Some(woke);
     }
     None
-}
-
-type SourceMap = FreeList<PinnedInnerSource>;
-pub(crate) type SourceId = Idx<PinnedInnerSource>;
-fn from_user_data(user_data: u64) -> SourceId {
-    SourceId::from_raw((user_data - 1) as usize)
-}
-fn to_user_data(id: SourceId) -> u64 {
-    id.to_raw() as u64 + 1
-}
-
-impl SourceMap {
-    fn add_source(&mut self, source: &Source, queue: ReactorQueue) -> SourceId {
-        let item = source.inner.clone();
-        let id = self.alloc(item);
-        let status = EnqueuedStatus::Enqueued;
-        source
-            .inner
-            .borrow_mut()
-            .enqueued
-            .replace(EnqueuedSource { id, queue, status });
-        id
-    }
-
-    fn peek_source_mut<R, Fn: for<'a> FnOnce(RefMut<'a, InnerSource>) -> R>(
-        &mut self,
-        id: SourceId,
-        f: Fn,
-    ) -> R {
-        f(self[id].borrow_mut())
-    }
-
-    fn consume_source(&mut self, id: SourceId) -> PinnedInnerSource {
-        let source = self.dealloc(id);
-        source.borrow_mut().enqueued.take();
-        source
-    }
 }
 
 #[derive(Debug)]
