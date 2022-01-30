@@ -1,10 +1,9 @@
 use crate::{
     executor::bind_to_cpu_set,
-    sys::{InnerSource, SleepNotifier},
+    sys::{source::PinnedInnerSource, SleepNotifier},
     PoolPlacement,
 };
 use ahash::AHashMap;
-use alloc::rc::Rc;
 use core::fmt::{Debug, Formatter};
 use crossbeam::channel::{Receiver, Sender};
 use std::{
@@ -15,7 +14,6 @@ use std::{
     io::ErrorKind,
     os::unix::{ffi::OsStrExt, prelude::*},
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
     thread::JoinHandle,
 };
@@ -166,7 +164,7 @@ impl BlockingThread {
 pub(crate) struct BlockingThreadPool {
     tx: Sender<BlockingThreadReq>,
     rx: Receiver<BlockingThreadResp>,
-    sources: RefCell<AHashMap<u64, Pin<Rc<RefCell<InnerSource>>>>>,
+    sources: RefCell<AHashMap<u64, PinnedInnerSource>>,
     requests: Cell<u64>,
     _threads: Vec<BlockingThread>,
 }
@@ -203,11 +201,7 @@ impl BlockingThreadPool {
         })
     }
 
-    pub(super) fn push(
-        &self,
-        op: BlockingThreadOp,
-        source: Pin<Rc<RefCell<InnerSource>>>,
-    ) -> io::Result<()> {
+    pub(super) fn push(&self, op: BlockingThreadOp, source: PinnedInnerSource) -> io::Result<()> {
         let id = self.requests.get();
         self.requests.set(id.overflowing_add(1).0);
 

@@ -19,7 +19,6 @@ use std::{
     ops::Range,
     os::unix::io::RawFd,
     panic,
-    pin::Pin,
     ptr,
     rc::Rc,
     sync::Arc,
@@ -34,6 +33,7 @@ use crate::{
         self,
         blocking::{BlockingThreadOp, BlockingThreadPool},
         dma_buffer::{BufferStorage, DmaBuffer},
+        source::PinnedInnerSource,
         DirectIo,
         EnqueuedSource,
         EnqueuedStatus,
@@ -589,8 +589,8 @@ where
     None
 }
 
-type SourceMap = FreeList<Pin<Rc<RefCell<InnerSource>>>>;
-pub(crate) type SourceId = Idx<Pin<Rc<RefCell<InnerSource>>>>;
+type SourceMap = FreeList<PinnedInnerSource>;
+pub(crate) type SourceId = Idx<PinnedInnerSource>;
 fn from_user_data(user_data: u64) -> SourceId {
     SourceId::from_raw((user_data - 1) as usize)
 }
@@ -619,7 +619,7 @@ impl SourceMap {
         f(self[id].borrow_mut())
     }
 
-    fn consume_source(&mut self, id: SourceId) -> Pin<Rc<RefCell<InnerSource>>> {
+    fn consume_source(&mut self, id: SourceId) -> PinnedInnerSource {
         let source = self.dealloc(id);
         source.borrow_mut().enqueued.take();
         source

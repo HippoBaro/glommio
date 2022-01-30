@@ -158,9 +158,11 @@ impl fmt::Debug for InnerSource {
     }
 }
 
+pub(super) type PinnedInnerSource = Pin<Rc<RefCell<InnerSource>>>;
+
 #[derive(Debug)]
 pub struct Source {
-    pub(crate) inner: Pin<Rc<RefCell<InnerSource>>>,
+    pub(crate) inner: PinnedInnerSource,
 }
 
 impl Source {
