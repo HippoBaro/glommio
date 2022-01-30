@@ -8,7 +8,6 @@ use nix::poll::PollFlags;
 use rlimit::Resource;
 use std::{
     cell::{Cell, RefCell, RefMut},
-    collections::VecDeque,
     io,
     os::{raw::c_int, unix::io::RawFd},
     panic,
@@ -28,6 +27,7 @@ use crate::{
         blocking::{BlockingThreadOp, BlockingThreadPool},
         buffer::UringBufferAllocator,
         dma_buffer::DmaBuffer,
+        io_scheduler::{FIFOScheduler, IOScheduler, IOSchedulerSession, IOSchedulerSessionState},
         source::PinnedInnerSource,
         source_map::{from_user_data, to_user_data, SourceMap},
         DirectIo,
@@ -359,9 +359,10 @@ where
             return Some(false);
         }
 
-        let src = source_map
+        let (src, queue) = source_map
             .borrow_mut()
             .consume_source(from_user_data(value.user_data()));
+        queue.borrow_mut().mark_completed(&src);
 
         let mut inner_source = src.borrow_mut();
         inner_source.wakers.result = Some(post_process(
@@ -373,39 +374,43 @@ where
     None
 }
 
-#[derive(Debug)]
-pub(crate) struct UringQueueState {
-    submissions: VecDeque<PinnedInnerSource>,
-    cancellations: VecDeque<PinnedInnerSource>,
-}
-
-pub(crate) type ReactorQueue = Rc<RefCell<UringQueueState>>;
-
-impl UringQueueState {
-    fn with_capacity(cap: usize) -> ReactorQueue {
-        Rc::new(RefCell::new(UringQueueState {
-            submissions: VecDeque::with_capacity(cap),
-            cancellations: VecDeque::new(),
-        }))
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.submissions.is_empty() && self.cancellations.is_empty()
-    }
-
-    pub(crate) fn cancel_request(&mut self, src: &PinnedInnerSource) {
-        self.cancellations.push_back(InnerSource::pin(
-            IoRequirements::default(),
-            SourceType::Cancel(src.clone()),
-            None,
-            None,
-        ));
-    }
-}
-
 pub(crate) trait UringCommon {
-    fn submission_queue(&mut self) -> ReactorQueue;
+    fn scheduler(&mut self) -> Rc<RefCell<FIFOScheduler>>;
     fn submit_sqes(&mut self) -> io::Result<usize>;
+
+    fn force_submit_sqes(&mut self, woke: &mut usize) -> io::Result<usize> {
+        let to_submit = self.waiting_kernel_submission();
+
+        // if we fail to submit we need to make sure we collect CQEs before sleeping
+        let mut consumed = false;
+        let mut submitted = 0;
+        loop {
+            submitted += self
+                .submit_sqes()
+                .or_else(Reactor::busy_ok)
+                .or_else(Reactor::again_ok)
+                .or_else(Reactor::intr_ok)?;
+
+            if submitted < to_submit && !consumed {
+                consumed = true;
+                self.consume_completion_queue(woke);
+                println!("consuming");
+            } else if submitted < to_submit {
+                warn!(
+                    "failed to flush the required minimum of events ({}/{}); waiting for CQEs",
+                    submitted, to_submit
+                );
+                self.wait_for_events(1)
+                    .expect("failed to wait for CQE. Game over");
+                self.consume_completion_queue(woke);
+            } else {
+                break;
+            }
+        }
+
+        Ok(submitted)
+    }
+
     fn submit_wait_sqes(&mut self, wait: u32) -> io::Result<usize>;
     fn waiting_kernel_submission(&self) -> usize;
     fn in_kernel(&self) -> usize;
@@ -415,7 +420,10 @@ pub(crate) trait UringCommon {
     /// None if it wasn't possible to acquire an `sqe`. `Some(true)` if it was
     /// possible and there was something to dispatch. `Some(false)` if there
     /// was nothing to dispatch
-    fn submit_one_event(&mut self, queue: &mut VecDeque<PinnedInnerSource>) -> Option<bool>;
+    fn submit_one_source(
+        &mut self,
+        session: &mut IOSchedulerSession<'_, FIFOScheduler>,
+    ) -> Option<bool>;
     /// Return `None` if no event is completed, `Some(true)` for a task is woken
     /// up and `Some(false)` for not.
     fn consume_one_event(&mut self) -> Option<bool>;
@@ -428,41 +436,38 @@ pub(crate) trait UringCommon {
         true
     }
 
-    fn consume_sqe_queue(
-        &mut self,
-        queue: &mut VecDeque<PinnedInnerSource>,
-        mut dispatch: bool,
-    ) -> io::Result<usize> {
+    fn consume_scheduler(&mut self, woke: &mut usize) -> io::Result<usize> {
+        let mut submitted = 0;
+
         loop {
-            match self.submit_one_event(queue) {
-                None => {
-                    dispatch = true;
+            let scheduler = self.scheduler();
+            let status = {
+                let mut scheduler = scheduler.borrow_mut();
+                let mut session = scheduler.open_session();
+                while self.submit_one_source(&mut session).unwrap_or_default() {}
+                session.seal()
+            };
+            match (status, self.needs_kernel_enter()) {
+                (IOSchedulerSessionState::NeedsDrain, true) => {
+                    submitted += self
+                        .force_submit_sqes(woke)
+                        .or_else(Reactor::busy_ok)
+                        .or_else(Reactor::again_ok)
+                        .or_else(Reactor::intr_ok)?;
+                }
+                (_, need_submit) => {
+                    if need_submit {
+                        submitted += self
+                            .submit_sqes()
+                            .or_else(Reactor::busy_ok)
+                            .or_else(Reactor::again_ok)
+                            .or_else(Reactor::intr_ok)?;
+                    }
                     break;
                 }
-                Some(true) => {}
-                Some(false) => break,
             }
         }
-
-        if dispatch && self.needs_kernel_enter() {
-            self.submit_sqes()
-        } else {
-            Ok(0)
-        }
-    }
-
-    /// We will not dispatch the cancellation queue unless we need to.
-    /// Dispatches will come from the submission queue.
-    fn consume_cancellation_queue(&mut self) -> io::Result<usize> {
-        let q = self.submission_queue();
-        let mut queue = q.borrow_mut();
-        self.consume_sqe_queue(&mut queue.cancellations, false)
-    }
-
-    fn consume_submission_queue(&mut self) -> io::Result<usize> {
-        let q = self.submission_queue();
-        let mut queue = q.borrow_mut();
-        self.consume_sqe_queue(&mut queue.submissions, true)
+        Ok(submitted)
     }
 
     fn consume_completion_queue(&mut self, woke: &mut usize) -> usize {
@@ -480,64 +485,8 @@ pub(crate) trait UringCommon {
         completed
     }
 
-    /// Used when we absolutely need to flush at least min_requests requests
-    /// from queue. This function blocks if it has to.
-    ///
-    /// min_requests does not account for SQEs waiting to be sent to the kernel.
-    /// If we have 2 items in the queue and 8 SQEs pending submission then
-    /// min_requests = 1 will submit all 8 SQEs + the first item in the queue.
-    ///
-    /// The function returns the number of elements submitted. This can be lower
-    /// than min_requests if there were fewer requests in the queue.
-    fn force_flush_ring(
-        &mut self,
-        queue: &mut VecDeque<PinnedInnerSource>,
-        mut min_requests: usize,
-        woke: &mut usize,
-    ) -> usize {
-        // we can't submit more request than what's there to submit + pending SQEs
-        min_requests = min_requests.min(queue.len()) + self.waiting_kernel_submission();
-
-        // if we fail to submit we need to make sure we collect CQEs before sleeping
-        let mut consumed = false;
-        let mut submitted = 0;
-        loop {
-            match self.consume_sqe_queue(queue, true) {
-                Err(err) => {
-                    if !consumed {
-                        consumed = true;
-                    } else {
-                        warn!(
-                            "failed to flush the required minimum of events ({}/{}): {}; waiting \
-                             for {} CQEs",
-                            submitted,
-                            min_requests,
-                            err,
-                            min_requests - submitted
-                        );
-                        self.wait_for_events((min_requests - submitted) as u32)
-                            .expect("failed to wait for CQE. Game over");
-                        consumed = false;
-                    }
-                    self.consume_completion_queue(woke);
-                }
-                Ok(x) => submitted += x,
-            }
-
-            if submitted >= min_requests {
-                break;
-            }
-        }
-
-        submitted
-    }
-
     fn poll(&mut self, woke: &mut usize) -> io::Result<()> {
-        self.consume_cancellation_queue()
-            .or_else(Reactor::busy_ok)
-            .or_else(Reactor::again_ok)
-            .or_else(Reactor::intr_ok)?;
-        self.consume_submission_queue()
+        self.consume_scheduler(woke)
             .or_else(Reactor::busy_ok)
             .or_else(Reactor::again_ok)
             .or_else(Reactor::intr_ok)?;
@@ -549,7 +498,7 @@ pub(crate) trait UringCommon {
 struct PollRing {
     ring: iou::IoUring,
     _size: usize,
-    submission_queue: ReactorQueue,
+    scheduler: Rc<RefCell<FIFOScheduler>>,
     allocator: Rc<UringBufferAllocator>,
     stats: RingIoStats,
     task_queue_stats: AHashMap<TaskQueueHandle, RingIoStats>,
@@ -571,7 +520,7 @@ impl PollRing {
         Ok(PollRing {
             _size: size,
             ring,
-            submission_queue: UringQueueState::with_capacity(size * 4),
+            scheduler: Rc::new(RefCell::new(FIFOScheduler::with_capacity(size * 4))),
             allocator,
             stats: RingIoStats::default(),
             task_queue_stats: AHashMap::new(),
@@ -610,7 +559,7 @@ impl UringCommon for PollRing {
     }
 
     fn can_sleep(&self) -> bool {
-        self.submission_queue.borrow().is_empty() && !self.needs_kernel_enter()
+        self.scheduler.borrow().is_empty() && !self.needs_kernel_enter()
     }
 
     fn waiting_kernel_submission(&self) -> usize {
@@ -625,8 +574,8 @@ impl UringCommon for PollRing {
         self.ring.cq().ready() as usize
     }
 
-    fn submission_queue(&mut self) -> ReactorQueue {
-        self.submission_queue.clone()
+    fn scheduler(&mut self) -> Rc<RefCell<FIFOScheduler>> {
+        self.scheduler.clone()
     }
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
@@ -659,17 +608,20 @@ impl UringCommon for PollRing {
         self.ring.cq().wait(events)
     }
 
-    fn submit_one_event(&mut self, queue: &mut VecDeque<PinnedInnerSource>) -> Option<bool> {
+    fn submit_one_source(
+        &mut self,
+        session: &mut IOSchedulerSession<'_, FIFOScheduler>,
+    ) -> Option<bool> {
         let source_map = &mut *self.source_map.borrow_mut();
         let mut sq = self.ring.sq();
 
-        let sqes = queue
-            .front()
+        let sqes = session
+            .peek()
             .map(|src| sq.prepare_sqes(sqe_required(src) as u32));
 
         match sqes {
             Some(Some(sqes)) => {
-                let src = queue.pop_front().unwrap();
+                let src = session.pop().unwrap();
                 let mut x = src.borrow_mut();
                 x.wakers.submitted_at = Some(Instant::now());
                 let enqueued = x.enqueued.as_ref().map(|x| (x.status, x.id));
@@ -702,7 +654,7 @@ impl UringCommon for PollRing {
 struct SleepableRing {
     ring: iou::IoUring,
     _size: usize,
-    submission_queue: ReactorQueue,
+    scheduler: Rc<RefCell<FIFOScheduler>>,
     name: &'static str,
     allocator: Rc<UringBufferAllocator>,
     stats: RingIoStats,
@@ -722,7 +674,7 @@ impl SleepableRing {
         Ok(SleepableRing {
             ring: iou::IoUring::new(size as _)?,
             _size: size,
-            submission_queue: UringQueueState::with_capacity(size * 4),
+            scheduler: Rc::new(RefCell::new(FIFOScheduler::with_capacity(size * 4))),
             name,
             allocator,
             stats: RingIoStats::default(),
@@ -750,12 +702,11 @@ impl SleepableRing {
 
         self.source_map
             .borrow_mut()
-            .add_source(source.inner.clone(), self.submission_queue.clone());
+            .add_source(source.inner.clone(), self.scheduler.clone());
 
-        self.submission_queue()
+        self.scheduler()
             .borrow_mut()
-            .submissions
-            .push_front(source.inner.clone());
+            .schedule_emergency(source.inner.clone());
         source
     }
 
@@ -774,25 +725,22 @@ impl SleepableRing {
 
         self.source_map
             .borrow_mut()
-            .add_source(source.inner.clone(), self.submission_queue.clone());
+            .add_source(source.inner.clone(), self.scheduler.clone());
 
-        self.submission_queue
+        self.scheduler
             .borrow_mut()
-            .submissions
-            .push_front(source.inner.clone());
+            .schedule_emergency(source.inner.clone());
         source
     }
 
     fn prepare_foreign_notifier(&mut self, foreign_notifier_src: &Source) {
         if !foreign_notifier_src.is_installed().unwrap() {
-            self.source_map.borrow_mut().add_source(
-                foreign_notifier_src.inner.clone(),
-                self.submission_queue.clone(),
-            );
-            self.submission_queue
+            self.source_map
                 .borrow_mut()
-                .submissions
-                .push_front(foreign_notifier_src.inner.clone());
+                .add_source(foreign_notifier_src.inner.clone(), self.scheduler.clone());
+            self.scheduler
+                .borrow_mut()
+                .schedule_emergency(foreign_notifier_src.inner.clone());
         }
     }
 }
@@ -825,7 +773,7 @@ impl UringCommon for SleepableRing {
     }
 
     fn can_sleep(&self) -> bool {
-        self.submission_queue.borrow().is_empty()
+        self.scheduler.borrow().is_empty()
             && self.waiting_kernel_submission() == 0
             && self.waiting_kernel_collection() == 0
     }
@@ -842,8 +790,8 @@ impl UringCommon for SleepableRing {
         self.ring.cq().ready() as usize
     }
 
-    fn submission_queue(&mut self) -> ReactorQueue {
-        self.submission_queue.clone()
+    fn scheduler(&mut self) -> Rc<RefCell<FIFOScheduler>> {
+        self.scheduler.clone()
     }
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
@@ -881,17 +829,20 @@ impl UringCommon for SleepableRing {
         self.ring.cq().wait(events)
     }
 
-    fn submit_one_event(&mut self, queue: &mut VecDeque<PinnedInnerSource>) -> Option<bool> {
+    fn submit_one_source(
+        &mut self,
+        session: &mut IOSchedulerSession<'_, FIFOScheduler>,
+    ) -> Option<bool> {
         let source_map = &mut *self.source_map.borrow_mut();
         let mut sq = self.ring.sq();
 
-        let sqes = queue
-            .front()
+        let sqes = session
+            .peek()
             .map(|src| sq.prepare_sqes(sqe_required(src) as u32));
 
         match sqes {
             Some(Some(sqes)) => {
-                let src = queue.pop_front().unwrap();
+                let src = session.pop().unwrap();
                 let mut x = src.borrow_mut();
                 x.wakers.submitted_at = Some(Instant::now());
                 let enqueued = x.enqueued.as_ref().map(|x| (x.status, x.id));
@@ -971,46 +922,16 @@ macro_rules! consume_rings {
     }}
 }
 
-/// It is important to process cancellations as soon as we see them,
-/// which is why they go into a separate queue. The reason is that
-/// cancellations can be racy if they are left to their own devices.
-///
-/// Imagine that you have a write request to fd 3 and wants to cancel it.
-/// But before the cancellation is run fd 3 gets closed and another file
-/// is opened with the same fd.
-macro_rules! flush_cancellations {
-    (into $output:expr; $( $ring:expr ),+ ) => {{
-        $(
-            let q = $ring.submission_queue();
-            let mut queue = q.borrow_mut();
-            let min = queue.cancellations.len();
-            $ring.force_flush_ring(&mut queue.cancellations, min, $output);
-        )*
-    }}
-}
-
 macro_rules! flush_rings {
-    ($( $ring:expr ),+ ) => {{
+    (into $woke:expr; $( $ring:expr ),+ ) => {{
         let mut ret = 0;
         $(
-            ret += $ring.consume_submission_queue()
+            ret += $ring.consume_scheduler($woke)
                 .or_else(Reactor::busy_ok)
                 .or_else(Reactor::again_ok)
                 .or_else(Reactor::intr_ok)?;
         )*
         io::Result::Ok(ret)
-    }}
-}
-
-macro_rules! force_flush_rings {
-     (into $output:expr; $min:expr, $( $ring:expr ),+ ) => {{
-        let mut ret = 0;
-        $(
-            let q = $ring.submission_queue();
-            let mut queue = q.borrow_mut();
-            ret += $ring.force_flush_ring(&mut queue.submissions, $min, &mut ret);
-        )*
-        ret
     }}
 }
 
@@ -1473,9 +1394,7 @@ impl Reactor {
         // Prepare the foreign notifier
         lat_ring.prepare_foreign_notifier(&self.foreign_notifier_src);
 
-        flush_cancellations!(into &mut woke; lat_ring, poll_ring, main_ring);
-        flush_rings!(lat_ring, poll_ring, main_ring)?;
-        // pick up the results of any cancellations
+        flush_rings!(into &mut woke; lat_ring, poll_ring, main_ring)?;
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
         // If we generated any event so far, we can't sleep. Need to handle them.
@@ -1491,7 +1410,7 @@ impl Reactor {
             if let Some(dur) = user_timer {
                 self.latency_preemption_timeout_src
                     .set(Some(lat_ring.prepare_latency_preemption_timer(dur)));
-                assert!(flush_rings!(lat_ring)? > 0);
+                assert!(flush_rings!(into &mut 0; lat_ring)? > 0);
             }
             // From this moment on the remote executors are aware that we are sleeping
             // We have to sweep the remote channels function once more because since
@@ -1508,8 +1427,7 @@ impl Reactor {
                     self.link_rings_and_sleep(&mut main_ring)
                         .expect("some error");
                     // May have new cancellations related to the link ring fd.
-                    flush_cancellations!(into &mut 0; lat_ring, poll_ring, main_ring);
-                    flush_rings!(lat_ring, poll_ring, main_ring)?;
+                    flush_rings!(into &mut 0; lat_ring, poll_ring, main_ring)?;
                     consume_rings!(into &mut 0; lat_ring, poll_ring, main_ring);
                 }
                 // Woke up, so no need to notify us anymore.
@@ -1521,7 +1439,7 @@ impl Reactor {
             lat_ring.prepare_foreign_notifier(&self.foreign_notifier_src);
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
-            assert!(force_flush_rings!(into &mut 0; 1, lat_ring, main_ring) > 0);
+            assert!(flush_rings!(into &mut 0; lat_ring, main_ring)? > 0);
         }
 
         // A Note about `need_preempt`:
@@ -1553,9 +1471,8 @@ impl Reactor {
 
     /// RAII-close asynchronously files that were not closed explicitly.
     pub(crate) fn async_close(&self, fd: RawFd) {
-        let q = self.main_ring.borrow_mut().submission_queue();
-        let mut queue = q.borrow_mut();
-        queue.submissions.push_back(InnerSource::pin(
+        let q = self.main_ring.borrow_mut().scheduler();
+        q.borrow_mut().schedule(InnerSource::pin(
             IoRequirements::default(),
             SourceType::Close(fd),
             None,
@@ -1634,11 +1551,11 @@ fn queue_request_into_ring(
     source_map: &mut SourceMap,
 ) {
     source.inner.borrow_mut().wakers.queued_at = Some(Instant::now());
-    let q = ring.submission_queue();
+    let q = ring.scheduler();
     source_map.add_source(source.inner.clone(), q.clone());
 
     let mut queue = q.borrow_mut();
-    queue.submissions.push_back(source.inner.clone());
+    queue.schedule(source.inner.clone());
 }
 
 impl Drop for Reactor {

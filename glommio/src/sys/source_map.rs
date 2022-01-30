@@ -1,8 +1,15 @@
 use crate::{
     free_list::{FreeList, Idx},
-    sys::{source::PinnedInnerSource, EnqueuedSource, EnqueuedStatus, InnerSource, ReactorQueue},
+    sys::{
+        io_scheduler::FIFOScheduler,
+        source::PinnedInnerSource,
+        EnqueuedSource,
+        EnqueuedStatus,
+        InnerSource,
+    },
 };
-use std::cell::RefMut;
+use alloc::rc::Rc;
+use std::cell::{RefCell, RefMut};
 
 pub(super) type SourceMap = FreeList<PinnedInnerSource>;
 pub(crate) type SourceId = Idx<PinnedInnerSource>;
@@ -14,7 +21,11 @@ pub(super) fn to_user_data(id: SourceId) -> u64 {
 }
 
 impl SourceMap {
-    pub(super) fn add_source(&mut self, src: PinnedInnerSource, queue: ReactorQueue) -> SourceId {
+    pub(super) fn add_source(
+        &mut self,
+        src: PinnedInnerSource,
+        queue: Rc<RefCell<FIFOScheduler>>,
+    ) -> SourceId {
         let id = self.alloc(src);
         self.peek_source_mut(id, |mut src| {
             src.enqueued.replace(EnqueuedSource {
@@ -34,9 +45,13 @@ impl SourceMap {
         f(self[id].borrow_mut())
     }
 
-    pub(super) fn consume_source(&mut self, id: SourceId) -> PinnedInnerSource {
+    pub(super) fn consume_source(
+        &mut self,
+        id: SourceId,
+    ) -> (PinnedInnerSource, Rc<RefCell<FIFOScheduler>>) {
         let source = self.dealloc(id);
-        source.borrow_mut().enqueued.take();
-        source
+        let enqueued = source.borrow_mut().enqueued.take();
+
+        (source, enqueued.unwrap().queue)
     }
 }

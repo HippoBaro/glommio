@@ -27,12 +27,12 @@ use nix::{
 use crate::{
     iou::sqe::{SockAddr, SockAddrStorage},
     sys::{
+        io_scheduler::{FIFOScheduler, IOScheduler},
         source_map::SourceId,
         DmaBuffer,
         IoBuffer,
         OsResult,
         PollableStatus,
-        ReactorQueue,
         TimeSpec64,
         Wakers,
     },
@@ -111,7 +111,7 @@ pub(crate) enum EnqueuedStatus {
 #[derive(Clone)]
 pub struct EnqueuedSource {
     pub(crate) id: SourceId,
-    pub(crate) queue: ReactorQueue,
+    pub(crate) queue: Rc<RefCell<FIFOScheduler>>,
     pub(crate) status: EnqueuedStatus,
 }
 
@@ -385,7 +385,7 @@ impl Drop for Source {
                     // now, so we delay `consume_source` until we consume the
                     // corresponding event from the completion queue.
 
-                    queue.borrow_mut().cancel_request(&self.inner);
+                    queue.borrow_mut().cancel(&self.inner);
                     *status = EnqueuedStatus::Canceled; // not necessary, but useful for correctness
                 }
                 EnqueuedStatus::Canceled => unreachable!(),

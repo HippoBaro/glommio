@@ -181,6 +181,7 @@ pub(crate) fn sendmsg_syscall(
 
 mod buffer;
 mod dma_buffer;
+mod io_scheduler;
 pub(crate) mod source;
 mod source_map;
 pub(crate) mod sysfs;
