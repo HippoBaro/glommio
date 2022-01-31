@@ -1,5 +1,5 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Ref, RefCell},
     convert::TryFrom,
     ffi::CString,
     fmt,
@@ -222,10 +222,6 @@ impl Source {
 
     pub(super) fn source_type(&self) -> Ref<'_, SourceType> {
         Ref::map(self.inner.borrow(), |x| &x.source_type)
-    }
-
-    pub(crate) fn source_type_mut(&self) -> RefMut<'_, SourceType> {
-        RefMut::map(self.inner.borrow_mut(), |x| &mut x.source_type)
     }
 
     pub(crate) fn extract_source_type(self) -> SourceType {

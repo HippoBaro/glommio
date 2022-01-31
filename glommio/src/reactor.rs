@@ -307,7 +307,7 @@ impl Reactor {
             SourceType::Write(fd, pos, pollable, IoBuffer::Dma(buf)),
             Some(stats),
         );
-        self.sys.write_dma(&source, pos);
+        self.sys.write_dma(&source);
         source
     }
 
@@ -332,7 +332,7 @@ impl Reactor {
             ),
             Some(stats),
         );
-        self.sys.write_buffered(&source, pos);
+        self.sys.write_buffered(&source);
         source
     }
 
@@ -358,7 +358,7 @@ impl Reactor {
 
     pub(crate) fn poll_read_ready(&self, fd: RawFd) -> Source {
         let source = self.new_source(SourceType::PollAdd(fd, common_flags() | read_flags()), None);
-        self.sys.poll_ready(&source, common_flags() | read_flags());
+        self.sys.poll_ready(&source);
         source
     }
 
@@ -367,7 +367,7 @@ impl Reactor {
             SourceType::PollAdd(fd, common_flags() | write_flags()),
             None,
         );
-        self.sys.poll_ready(&source, common_flags() | write_flags());
+        self.sys.poll_ready(&source);
         source
     }
 
@@ -381,7 +381,7 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.send(&source, MsgFlags::empty());
+        self.sys.send(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -417,7 +417,7 @@ impl Reactor {
             source.set_timeout(timeout);
         }
 
-        self.sys.sendmsg(&source, MsgFlags::empty());
+        self.sys.sendmsg(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -457,7 +457,7 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.recvmsg(&source, size, flags);
+        self.sys.recvmsg(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -475,14 +475,14 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.recv(&source, size, MsgFlags::empty());
+        self.sys.recv(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
 
     pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: MsgFlags) -> Source {
         let source = self.new_source(SourceType::SockRecv(fd, size, None, flags), None);
-        self.sys.recv(&source, size, flags);
+        self.sys.recv(&source);
         source
     }
 
@@ -530,11 +530,11 @@ impl Reactor {
             {
                 source
             } else {
-                self.sys.read_dma(&source, pos, size);
+                self.sys.read_dma(&source);
                 scheduler.schedule(source, pos..pos + size as u64)
             }
         } else {
-            self.sys.read_dma(&source, pos, size);
+            self.sys.read_dma(&source);
             ScheduledSource::new_raw(source, pos..pos + size as u64)
         }
     }
@@ -586,11 +586,11 @@ impl Reactor {
             {
                 source
             } else {
-                self.sys.read_buffered(&source, pos, size);
+                self.sys.read_buffered(&source);
                 scheduler.schedule(source, pos..pos + size as u64)
             }
         } else {
-            self.sys.read_buffered(&source, pos, size);
+            self.sys.read_buffered(&source);
             ScheduledSource::new_raw(source, pos..pos + size as u64)
         }
     }
@@ -617,7 +617,7 @@ impl Reactor {
             ),
             None,
         );
-        self.sys.fallocate(&source, position, size, flags);
+        self.sys.fallocate(&source);
         source
     }
 
@@ -654,7 +654,7 @@ impl Reactor {
             ),
             None,
         );
-        self.sys.create_dir(&source, mode);
+        self.sys.create_dir(&source);
         source
     }
 
@@ -723,7 +723,7 @@ impl Reactor {
                 latency: None,
             }),
         );
-        self.sys.open_at(&source, flags, mode);
+        self.sys.open_at(&source);
         source
     }
 
