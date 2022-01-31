@@ -326,6 +326,19 @@ impl UringWriteBuf for &'_ [u8] {
     }
 }
 
+impl UringWriteBuf for &'_ u64 {
+    unsafe fn prep_write(self, fd: impl UringFd, sqe: &mut SQE<'_>, offset: u64) {
+        uring_sys::io_uring_prep_write(
+            sqe.raw_mut(),
+            fd.as_raw_fd(),
+            self as *const _ as _,
+            8,
+            offset as _,
+        );
+        fd.update_sqe(sqe);
+    }
+}
+
 impl UringWriteBuf for io::IoSlice<'_> {
     unsafe fn prep_write(self, fd: impl UringFd, sqe: &mut SQE<'_>, offset: u64) {
         uring_sys::io_uring_prep_write(

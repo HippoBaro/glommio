@@ -400,6 +400,15 @@ impl DerefMut for IoBuffer {
     }
 }
 
+impl IoBuffer {
+    pub(crate) fn uring_buffer_id(&self) -> Option<u32> {
+        match &self {
+            IoBuffer::Dma(buf) => buf.uring_buffer_id(),
+            IoBuffer::Buffered(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum DirectIo {
     Enabled,

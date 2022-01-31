@@ -72,12 +72,12 @@ pub(crate) enum SourceType {
     Fallocate(RawFd, u64, usize, FallocateFlags),
     Truncate(RawFd, usize),
     Close(RawFd),
-    LinkRings(RawFd),
     ForeignNotifier(RawFd, u64, bool),
     Statx(RawFd, CString, Box<RefCell<libc::statx>>),
     Timeout(TimeSpec64, u32),
     Connect(RawFd, SockAddr),
     Accept(RawFd, SockAddrStorage),
+    ThroughputPreemption(RawFd, TimeSpec64, u32),
     Rename(PathBuf, PathBuf),
     CreateDir(PathBuf, Mode),
     Remove(PathBuf),
@@ -151,6 +151,23 @@ pub(crate) struct InnerSource {
 }
 
 impl InnerSource {
+    pub(crate) fn pin(
+        ioreq: IoRequirements,
+        source_type: SourceType,
+        stats_collection: Option<StatsCollection>,
+        task_queue: Option<TaskQueueHandle>,
+    ) -> PinnedInnerSource {
+        PinnedInnerSource::new(Rc::new(RefCell::new(InnerSource {
+            wakers: Wakers::new(),
+            source_type,
+            io_requirements: ioreq,
+            enqueued: None,
+            timeout: None,
+            stats_collection,
+            task_queue,
+        })))
+    }
+
     pub(crate) fn update_source_type(&mut self, source_type: SourceType) -> SourceType {
         std::mem::replace(&mut self.source_type, source_type)
     }
@@ -200,10 +217,6 @@ impl Source {
         let old = *t;
         *t = Some(TimeSpec64::from(d));
         old.map(Duration::from)
-    }
-
-    pub(super) fn timeout_ref(&self) -> Ref<'_, Option<TimeSpec64>> {
-        Ref::map(self.inner.borrow(), |x| &x.timeout)
     }
 
     pub(super) fn source_type(&self) -> Ref<'_, SourceType> {
@@ -323,7 +336,6 @@ impl Source {
             SourceType::Fallocate(fd, _, _, _) => fd,
             SourceType::Truncate(fd, _) => fd,
             SourceType::Close(fd) => fd,
-            SourceType::LinkRings(fd) => fd,
             SourceType::ForeignNotifier(fd, _, _) => fd,
             SourceType::Statx(fd, _, _) => fd,
             SourceType::Connect(fd, _) => fd,
