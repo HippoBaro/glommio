@@ -308,7 +308,7 @@ pub(crate) mod test {
 
         assert!(file.consume_scheduled(0..512, None).is_none());
         let sched_source1 = file.schedule(
-            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            Source::new(Default::default(), SourceType::Invalid, None, None),
             0..512,
         );
         let sched_source2 = file.consume_scheduled(0..512, None).unwrap();
@@ -328,7 +328,7 @@ pub(crate) mod test {
             let sched = Rc::new(IoScheduler::new());
             let file = sched.get_file_scheduler((0, 1));
             let _ = file.schedule(
-                Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+                Source::new(Default::default(), SourceType::Invalid, None, None),
                 0..512,
             );
             // test dropping a ScheduledSource with a ScheduledFile but no io scheduler
@@ -339,7 +339,7 @@ pub(crate) mod test {
             let sched = Rc::new(IoScheduler::new());
             let file = sched.get_file_scheduler((0, 1));
             let _ = file.schedule(
-                Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+                Source::new(Default::default(), SourceType::Invalid, None, None),
                 0..512,
             );
             // test dropping a ScheduledSource with no host ScheduledFile
@@ -350,7 +350,7 @@ pub(crate) mod test {
             let sched = Rc::new(IoScheduler::new());
             let file = sched.get_file_scheduler((0, 1));
             let _ = file.schedule(
-                Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+                Source::new(Default::default(), SourceType::Invalid, None, None),
                 0..512,
             );
             // test dropping a ScheduledSource with no host ScheduledFile and io scheduler

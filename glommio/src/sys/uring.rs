@@ -184,10 +184,11 @@ fn fill_sqe<F>(
             UringOpDescriptor::Read(pos, len) => {
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut x| {
                     match &mut x.source_type {
-                        SourceType::ForeignNotifier(result, _) => {
+                        SourceType::ForeignNotifier(_, result, _) => {
                             sqe.prep_read(op.fd, result, pos);
                         }
                         SourceType::Read(
+                            _,
                             _,
                             _,
                             PollableStatus::NonPollable(DirectIo::Disabled),
@@ -256,13 +257,14 @@ fn fill_sqe<F>(
                         SourceType::Read(
                             _,
                             _,
+                            _,
                             PollableStatus::NonPollable(DirectIo::Disabled),
                             slot,
                         ) => {
                             sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
                             *slot = Some(IoBuffer::Dma(buf));
                         }
-                        SourceType::Read(_, _, _, slot) => {
+                        SourceType::Read(_, _, _, _, slot) => {
                             match buf.uring_buffer_id() {
                                 None => {
                                     sqe.prep_read(op.fd, buf.as_bytes_mut(), pos);
@@ -310,7 +312,7 @@ fn fill_sqe<F>(
 
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
                     match &mut src.source_type {
-                        SourceType::SockRecv(_, slot, _) => {
+                        SourceType::SockRecv(_, _, slot, _) => {
                             *slot = Some(buf);
                         }
                         _ => unreachable!(),
@@ -322,7 +324,7 @@ fn fill_sqe<F>(
                 let mut buf = DmaBuffer::new(len).expect("failed to allocate buffer");
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
                     match &mut src.source_type {
-                        SourceType::SockRecvMsg(_, slot, _, iov, hdr, msg_name) => {
+                        SourceType::SockRecvMsg(_, _, slot, _, iov, hdr, msg_name) => {
                             iov.iov_base = buf.as_mut_ptr() as *mut libc::c_void;
                             iov.iov_len = len;
 
@@ -831,7 +833,6 @@ impl SleepableRing {
     fn prepare_latency_preemption_timer(&mut self, d: Duration) -> Source {
         let source = Source::new(
             IoRequirements::default(),
-            -1,
             SourceType::Timeout(TimeSpec64::from(d), 0),
             None,
             None,
@@ -867,7 +868,6 @@ impl SleepableRing {
         assert!(min_events >= 1, "min_events should be at least 1");
         let timer_source = Source::new(
             IoRequirements::default(),
-            -1,
             SourceType::Timeout(TimeSpec64::from(Duration::MAX), min_events),
             None,
             None,
@@ -925,7 +925,7 @@ impl SleepableRing {
             );
 
             match &mut *eventfd_src.source_type_mut() {
-                SourceType::ForeignNotifier(_, installed) => {
+                SourceType::ForeignNotifier(_, _, installed) => {
                     *installed = self.submit_sqes().is_ok();
                     *installed
                 }
@@ -1060,7 +1060,7 @@ impl UringCommon for SleepableRing {
             self.ring.peek_for_cqe(),
             |src, res| {
                 record_stats(self, src, &res);
-                if let SourceType::ForeignNotifier(_, installed) = &mut src.source_type {
+                if let SourceType::ForeignNotifier(_, _, installed) = &mut src.source_type {
                     *installed = false;
                 }
                 res
@@ -1267,8 +1267,7 @@ impl Reactor {
 
         let eventfd_src = Source::new(
             IoRequirements::default(),
-            notifier.eventfd_fd(),
-            SourceType::ForeignNotifier(0, false),
+            SourceType::ForeignNotifier(notifier.eventfd_fd(), 0, false),
             None,
             None,
         );
@@ -1321,10 +1320,11 @@ impl Reactor {
         let op = match &*source.source_type() {
             SourceType::Write(
                 _,
+                _,
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Dma(buf),
             ) => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
-            SourceType::Write(_, _, IoBuffer::Dma(buf)) => match buf.uring_buffer_id() {
+            SourceType::Write(_, _, _, IoBuffer::Dma(buf)) => match buf.uring_buffer_id() {
                 Some(id) => UringOpDescriptor::WriteFixed(buf.as_ptr(), buf.len(), pos, id),
                 None => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
             },
@@ -1341,6 +1341,7 @@ impl Reactor {
     pub(crate) fn write_buffered(&self, source: &Source, pos: u64) {
         let op = match &*source.source_type() {
             SourceType::Write(
+                _,
                 _,
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Buffered(buf),
@@ -1387,7 +1388,7 @@ impl Reactor {
 
     pub(crate) fn send(&self, source: &Source, flags: MsgFlags) {
         let op = match &*source.source_type() {
-            SourceType::SockSend(buf, _) => {
+            SourceType::SockSend(_, buf, _) => {
                 UringOpDescriptor::SockSend(buf.as_ptr() as *const u8, buf.len(), flags.bits())
             }
             _ => unreachable!(),
@@ -1402,7 +1403,7 @@ impl Reactor {
 
     pub(crate) fn sendmsg(&self, source: &Source, flags: MsgFlags) {
         let op = match &mut *source.source_type_mut() {
-            SourceType::SockSendMsg(_, _, iov, hdr, addr) => {
+            SourceType::SockSendMsg(_, _, _, iov, hdr, addr) => {
                 let (msg_name, msg_namelen) = addr.as_ffi_pair();
                 let msg_name = msg_name as *const nix::sys::socket::sockaddr as *mut libc::c_void;
 
@@ -1445,7 +1446,7 @@ impl Reactor {
 
     pub(crate) fn connect(&self, source: &Source) {
         let op = match &*source.source_type() {
-            SourceType::Connect(addr) => UringOpDescriptor::Connect(addr as *const SockAddr),
+            SourceType::Connect(_, addr) => UringOpDescriptor::Connect(addr as *const SockAddr),
             x => panic!("Unexpected source type for connect: {:?}", x),
         };
         queue_request_into_ring(
@@ -1458,7 +1459,7 @@ impl Reactor {
 
     pub(crate) fn accept(&self, source: &Source) {
         let op = match &mut *source.source_type_mut() {
-            SourceType::Accept(addr) => UringOpDescriptor::Accept(addr as *mut SockAddrStorage),
+            SourceType::Accept(_, addr) => UringOpDescriptor::Accept(addr as *mut SockAddrStorage),
             x => panic!("Unexpected source type for accept: {:?}", x),
         };
         queue_request_into_ring(
@@ -1548,7 +1549,7 @@ impl Reactor {
 
     pub(crate) fn statx(&self, source: &Source) {
         let op = match &*source.source_type() {
-            SourceType::Statx(path, buf) => {
+            SourceType::Statx(_, path, buf) => {
                 let path = path.as_c_str().as_ptr();
                 let buf = buf.as_ptr();
                 UringOpDescriptor::Statx(path as _, buf)
@@ -1565,7 +1566,7 @@ impl Reactor {
 
     pub(crate) fn open_at(&self, source: &Source, flags: libc::c_int, mode: libc::mode_t) {
         let pathptr = match &*source.source_type() {
-            SourceType::Open(cstring, _, _) => cstring.as_c_str().as_ptr(),
+            SourceType::Open(_, cstring, _, _) => cstring.as_c_str().as_ptr(),
             _ => panic!("Wrong source type!"),
         };
         let op = UringOpDescriptor::Open(pathptr as _, flags, mode as _);
@@ -1633,8 +1634,7 @@ impl Reactor {
     fn link_rings_and_sleep(&self, ring: &mut SleepableRing) -> io::Result<()> {
         let mut link_rings = Source::new(
             IoRequirements::default(),
-            self.link_fd,
-            SourceType::LinkRings,
+            SourceType::LinkRings(self.link_fd),
             None,
             None,
         );
@@ -1839,14 +1839,14 @@ impl Reactor {
         // because the more request we issue there, the less effective it becomes.
 
         match &*source.source_type() {
-            SourceType::Read(_, _, p, _) | SourceType::Write(_, p, _) => match p {
+            SourceType::Read(_, _, _, p, _) | SourceType::Write(_, _, p, _) => match p {
                 PollableStatus::Pollable => self.poll_ring.borrow_mut(),
                 PollableStatus::NonPollable(_) => self.main_ring.borrow_mut(),
             },
-            SourceType::SockRecv(_, _, _)
-            | SourceType::SockRecvMsg(_, _, _, _, _, _)
-            | SourceType::Accept(_)
-            | SourceType::Connect(_) => self.latency_ring.borrow_mut(),
+            SourceType::SockRecv(_, _, _, _)
+            | SourceType::SockRecvMsg(_, _, _, _, _, _, _)
+            | SourceType::Accept(_, _)
+            | SourceType::Connect(_, _) => self.latency_ring.borrow_mut(),
             SourceType::Invalid => {
                 unreachable!("called ring_for_source on invalid source")
             }
@@ -1945,7 +1945,6 @@ mod tests {
         fn timeout_source(millis: u64) -> (Source, UringOpDescriptor) {
             let source = Source::new(
                 IoRequirements::default(),
-                -1,
                 SourceType::Timeout(TimeSpec64::from(Duration::from_millis(millis)), 0),
                 None,
                 None,

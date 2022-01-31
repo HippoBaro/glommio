@@ -245,7 +245,7 @@ impl<S: AsRawFd> NonBufferedStream<S> {
 
         let sz = source.collect_rw().await?;
         match source.extract_source_type() {
-            SourceType::SockRecv(_, mut src, _) => {
+            SourceType::SockRecv(_, _, mut src, _) => {
                 buf[0..sz].copy_from_slice(&src.take().unwrap().as_bytes()[0..sz]);
             }
             _ => unreachable!(),

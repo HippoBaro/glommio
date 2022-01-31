@@ -45,12 +45,13 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) enum SourceType {
-    Write(u64, PollableStatus, IoBuffer),
-    Read(u64, usize, PollableStatus, Option<IoBuffer>),
-    PollAdd(PollFlags),
-    SockSend(DmaBuffer, MsgFlags),
-    SockRecv(usize, Option<DmaBuffer>, MsgFlags),
+    Write(RawFd, u64, PollableStatus, IoBuffer),
+    Read(RawFd, u64, usize, PollableStatus, Option<IoBuffer>),
+    PollAdd(RawFd, PollFlags),
+    SockSend(RawFd, DmaBuffer, MsgFlags),
+    SockRecv(RawFd, usize, Option<DmaBuffer>, MsgFlags),
     SockRecvMsg(
+        RawFd,
         usize,
         Option<DmaBuffer>,
         MsgFlags,
@@ -59,23 +60,24 @@ pub(crate) enum SourceType {
         MaybeUninit<nix::sys::socket::sockaddr_storage>,
     ),
     SockSendMsg(
+        RawFd,
         DmaBuffer,
         MsgFlags,
         libc::iovec,
         libc::msghdr,
         nix::sys::socket::SockAddr,
     ),
-    Open(CString, OFlag, Mode),
-    FdataSync,
-    Fallocate(u64, usize, FallocateFlags),
-    Truncate(usize),
-    Close,
-    LinkRings,
-    ForeignNotifier(u64, bool),
-    Statx(CString, Box<RefCell<libc::statx>>),
+    Open(RawFd, CString, OFlag, Mode),
+    FdataSync(RawFd),
+    Fallocate(RawFd, u64, usize, FallocateFlags),
+    Truncate(RawFd, usize),
+    Close(RawFd),
+    LinkRings(RawFd),
+    ForeignNotifier(RawFd, u64, bool),
+    Statx(RawFd, CString, Box<RefCell<libc::statx>>),
     Timeout(TimeSpec64, u32),
-    Connect(SockAddr),
-    Accept(SockAddrStorage),
+    Connect(RawFd, SockAddr),
+    Accept(RawFd, SockAddrStorage),
     Rename(PathBuf, PathBuf),
     CreateDir(PathBuf, Mode),
     Remove(PathBuf),
@@ -90,7 +92,7 @@ impl TryFrom<SourceType> for libc::statx {
 
     fn try_from(value: SourceType) -> Result<Self, Self::Error> {
         match value {
-            SourceType::Statx(_, buf) => Ok(buf.into_inner()),
+            SourceType::Statx(_, _, buf) => Ok(buf.into_inner()),
             _ => Err(GlommioError::ReactorError(
                 ReactorErrorKind::IncorrectSourceType,
             )),
@@ -132,9 +134,6 @@ pub(crate) struct StatsCollection {
 
 /// A registered source of I/O events.
 pub(crate) struct InnerSource {
-    /// Raw file descriptor on Unix platforms.
-    pub(crate) raw: RawFd,
-
     /// Tasks interested in events on this source.
     pub(crate) wakers: Wakers,
 
@@ -160,7 +159,6 @@ impl InnerSource {
 impl fmt::Debug for InnerSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InnerSource")
-            .field("raw", &self.raw)
             .field("wakers", &self.wakers)
             .field("source_type", &self.source_type)
             .field("io_requirements", &self.io_requirements)
@@ -179,14 +177,12 @@ impl Source {
     /// Registers an I/O source in the reactor.
     pub(crate) fn new(
         ioreq: IoRequirements,
-        raw: RawFd,
         source_type: SourceType,
         stats_collection: Option<StatsCollection>,
         task_queue: Option<TaskQueueHandle>,
     ) -> Source {
         Source {
             inner: Rc::pin(RefCell::new(InnerSource {
-                raw,
                 wakers: Wakers::new(),
                 source_type,
                 io_requirements: ioreq,
@@ -227,16 +223,16 @@ impl Source {
     pub(crate) fn extract_buffer(self) -> IoBuffer {
         let stype = self.extract_source_type();
         match stype {
-            SourceType::Read(_, _, _, Some(buffer)) => buffer,
-            SourceType::Write(_, _, buffer) => buffer,
+            SourceType::Read(_, _, _, _, Some(buffer)) => buffer,
+            SourceType::Write(_, _, _, buffer) => buffer,
             x => panic!("Could not extract buffer. Source: {:?}", x),
         }
     }
 
     pub(crate) fn buffer(&self) -> Ref<'_, IoBuffer> {
         Ref::map(self.source_type(), |stype| match &*stype {
-            SourceType::Read(_, _, _, Some(buffer)) => buffer,
-            SourceType::Write(_, _, buffer) => buffer,
+            SourceType::Read(_, _, _, _, Some(buffer)) => buffer,
+            SourceType::Write(_, _, _, buffer) => buffer,
             x => panic!("Could not extract buffer. Source: {:?}", x),
         })
     }
@@ -306,13 +302,34 @@ impl Source {
 
     pub(super) fn is_installed(&self) -> Option<bool> {
         match &self.inner.borrow().source_type {
-            SourceType::ForeignNotifier(_, installed) => Some(*installed),
+            SourceType::ForeignNotifier(_, _, installed) => Some(*installed),
             _ => None,
         }
     }
 
     pub(super) fn raw(&self) -> RawFd {
-        self.inner.borrow().raw
+        // TODO(Hippo): Remove this once we get rif of UringDescriptor
+
+        match self.inner.borrow().source_type {
+            SourceType::Write(fd, _, _, _) => fd,
+            SourceType::Read(fd, _, _, _, _) => fd,
+            SourceType::PollAdd(fd, _) => fd,
+            SourceType::SockSend(fd, _, _) => fd,
+            SourceType::SockRecv(fd, _, _, _) => fd,
+            SourceType::SockRecvMsg(fd, _, _, _, _, _, _) => fd,
+            SourceType::SockSendMsg(fd, _, _, _, _, _) => fd,
+            SourceType::Open(fd, _, _, _) => fd,
+            SourceType::FdataSync(fd) => fd,
+            SourceType::Fallocate(fd, _, _, _) => fd,
+            SourceType::Truncate(fd, _) => fd,
+            SourceType::Close(fd) => fd,
+            SourceType::LinkRings(fd) => fd,
+            SourceType::ForeignNotifier(fd, _, _) => fd,
+            SourceType::Statx(fd, _, _) => fd,
+            SourceType::Connect(fd, _) => fd,
+            SourceType::Accept(fd, _) => fd,
+            _ => -1,
+        }
     }
 
     pub(crate) fn stats_collection(&self) -> Option<StatsCollection> {
