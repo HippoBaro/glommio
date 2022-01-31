@@ -29,7 +29,7 @@ use crate::{
         self,
         blocking::{BlockingThreadOp, BlockingThreadPool},
         buffer::UringBufferAllocator,
-        dma_buffer::{BufferStorage, DmaBuffer},
+        dma_buffer::DmaBuffer,
         source_map::{from_user_data, to_user_data, SourceId, SourceMap},
         DirectIo,
         EnqueuedStatus,
@@ -917,22 +917,10 @@ impl SleepableRing {
                 args: UringOpDescriptor::Read(0, 8),
             };
 
-            let buffer_ptr = {
-                match &mut *eventfd_src.source_type_mut() {
-                    SourceType::ForeignNotifier(result, _) => result as *mut _ as _,
-                    _ => unreachable!("Expected ForeignNotifier source type"),
-                }
-            };
-
             fill_sqe(
                 &mut sqe,
                 &op,
-                |size| {
-                    Some(DmaBuffer::with_storage(
-                        size,
-                        BufferStorage::EventFd(buffer_ptr),
-                    ))
-                },
+                |_| unreachable!(),
                 &mut *self.source_map.borrow_mut(),
             );
 

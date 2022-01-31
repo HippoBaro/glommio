@@ -52,7 +52,6 @@ impl Drop for SysAlloc {
 pub(crate) enum BufferStorage {
     Sys(SysAlloc),
     Uring(UringBuffer),
-    EventFd(*mut u8),
 }
 
 impl BufferStorage {
@@ -60,7 +59,6 @@ impl BufferStorage {
         match self {
             BufferStorage::Sys(x) => x.as_ptr(),
             BufferStorage::Uring(x) => x.as_ptr(),
-            BufferStorage::EventFd(x) => *x as *const u8,
         }
     }
 
@@ -68,7 +66,6 @@ impl BufferStorage {
         match self {
             BufferStorage::Sys(x) => x.as_mut_ptr(),
             BufferStorage::Uring(x) => x.as_mut_ptr(),
-            BufferStorage::EventFd(x) => *x,
         }
     }
 }

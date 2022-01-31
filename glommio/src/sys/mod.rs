@@ -190,7 +190,10 @@ pub use self::dma_buffer::DmaBuffer;
 pub(crate) use self::{source::*, uring::*};
 use crate::error::{ExecutorErrorKind, GlommioError};
 use smallvec::SmallVec;
-use std::{ops::Deref, sync::atomic::AtomicBool};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::atomic::AtomicBool,
+};
 
 #[derive(Debug, Default)]
 pub(crate) struct ReactorGlobalState {
@@ -381,9 +384,18 @@ impl Deref for IoBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        match &self {
+        match self {
             IoBuffer::Dma(buffer) => buffer.as_bytes(),
             IoBuffer::Buffered(buffer) => buffer.as_slice(),
+        }
+    }
+}
+
+impl DerefMut for IoBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            IoBuffer::Dma(buffer) => buffer.as_bytes_mut(),
+            IoBuffer::Buffered(buffer) => buffer.as_mut_slice(),
         }
     }
 }
