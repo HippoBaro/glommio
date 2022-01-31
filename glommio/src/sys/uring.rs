@@ -34,7 +34,7 @@ use crate::{
         buffer::UringBufferAllocator,
         dma_buffer::DmaBuffer,
         source::PinnedInnerSource,
-        source_map::{from_user_data, to_user_data, SourceId, SourceMap},
+        source_map::{from_user_data, to_user_data, SourceMap},
         DirectIo,
         EnqueuedStatus,
         InnerSource,
@@ -517,6 +517,10 @@ where
             sqe.prep_timeout(&ts.raw, *events, TimeoutFlags::empty());
             sqes.next().unwrap().prep_write(*fd, &EVENTFD_WAKEUP, 0);
         },
+        SourceType::Cancel(other) => unsafe {
+            let id = other.borrow().enqueued.as_ref().unwrap().id;
+            sqe.prep_cancel(to_user_data(id), 0)
+        },
         #[cfg(feature = "bench")]
         SourceType::Noop => unsafe {
             sqe.prep_nop();
@@ -666,7 +670,7 @@ where
 #[derive(Debug)]
 pub(crate) struct UringQueueState {
     submissions: VecDeque<PinnedInnerSource>,
-    cancellations: VecDeque<UringDescriptor>,
+    cancellations: VecDeque<PinnedInnerSource>,
 }
 
 pub(crate) type ReactorQueue = Rc<RefCell<UringQueueState>>;
@@ -683,13 +687,13 @@ impl UringQueueState {
         self.submissions.is_empty() && self.cancellations.is_empty()
     }
 
-    pub(crate) fn cancel_request(&mut self, id: SourceId) {
-        self.cancellations.push_back(UringDescriptor {
-            args: UringOpDescriptor::Cancel(to_user_data(id)),
-            fd: -1,
-            flags: SubmissionFlags::empty(),
-            user_data: 0,
-        });
+    pub(crate) fn cancel_request(&mut self, src: &PinnedInnerSource) {
+        self.cancellations.push_back(InnerSource::pin(
+            IoRequirements::default(),
+            SourceType::Cancel(src.clone()),
+            None,
+            None,
+        ));
     }
 }
 
@@ -770,7 +774,7 @@ pub(crate) trait UringCommon {
     fn consume_cancellation_queue(&mut self) -> io::Result<usize> {
         let q = self.submission_queue();
         let mut queue = q.borrow_mut();
-        self.consume_sqe_queue(&mut queue.cancellations, false)
+        self.consume_sqe_queue2(&mut queue.cancellations, false)
     }
 
     fn consume_submission_queue(&mut self) -> io::Result<usize> {
@@ -1428,7 +1432,7 @@ macro_rules! flush_cancellations {
             let q = $ring.submission_queue();
             let mut queue = q.borrow_mut();
             let min = queue.cancellations.len();
-            $ring.force_flush_ring(&mut queue.cancellations, min, $output);
+            $ring.force_flush_ring2(&mut queue.cancellations, min, $output);
         )*
     }}
 }

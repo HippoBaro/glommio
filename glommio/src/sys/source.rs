@@ -82,6 +82,7 @@ pub(crate) enum SourceType {
     CreateDir(PathBuf, Mode),
     Remove(PathBuf),
     BlockingFn,
+    Cancel(PinnedInnerSource),
     Invalid,
     #[cfg(feature = "bench")]
     Noop,
@@ -366,7 +367,12 @@ impl Drop for Source {
         let mut inner = self.inner.borrow_mut();
         inner.wakers.waiters.clear();
         let enqueued = inner.enqueued.as_mut();
-        if let Some(EnqueuedSource { id, queue, status }) = enqueued {
+        if let Some(EnqueuedSource {
+            id: _,
+            queue,
+            status,
+        }) = enqueued
+        {
             match status {
                 EnqueuedStatus::Enqueued => {
                     // We never submitted the request, so it's safe to consume
@@ -383,7 +389,7 @@ impl Drop for Source {
                     // now, so we delay `consume_source` until we consume the
                     // corresponding event from the completion queue.
 
-                    queue.borrow_mut().cancel_request(*id);
+                    queue.borrow_mut().cancel_request(&self.inner);
                     *status = EnqueuedStatus::Canceled; // not necessary, but useful for correctness
                 }
                 EnqueuedStatus::Canceled => unreachable!(),
