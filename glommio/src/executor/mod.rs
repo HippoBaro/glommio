@@ -1302,7 +1302,6 @@ impl LocalExecutor {
     fn run_task_queues(&self) -> bool {
         let mut ran = false;
         loop {
-            self.reactor.sys.install_eventfd();
             if self.need_preempt() {
                 break;
             }

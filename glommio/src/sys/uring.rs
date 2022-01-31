@@ -510,7 +510,8 @@ where
         SourceType::Accept(fd, addr) => unsafe {
             sqe.prep_accept(*fd, Some(&mut *addr), SockFlag::SOCK_CLOEXEC);
         },
-        SourceType::ForeignNotifier(fd, result, _) => unsafe {
+        SourceType::ForeignNotifier(fd, result, installed) => unsafe {
+            *installed = true;
             sqe.prep_read(*fd, result, 0);
         },
         SourceType::ThroughputPreemption(fd, ts, events) => unsafe {
@@ -1182,37 +1183,16 @@ impl SleepableRing {
         source
     }
 
-    fn install_eventfd(&mut self, eventfd_src: &Source) -> bool {
-        if let Some(mut sqe) = self.ring.sq().prepare_sqe() {
-            // Now must wait on the `eventfd` in case someone wants to wake us up.
-            // If we can't then we can't sleep and will just bail immediately
-            let op = UringDescriptor {
-                fd: eventfd_src.raw(),
-                flags: SubmissionFlags::empty(),
-                user_data: to_user_data(
-                    self.source_map
-                        .borrow_mut()
-                        .add_source(eventfd_src.inner.clone(), self.submission_queue.clone()),
-                ),
-                args: UringOpDescriptor::Read(0, 8),
-            };
-
-            fill_sqe(
-                &mut sqe,
-                &op,
-                |_| unreachable!(),
-                &mut *self.source_map.borrow_mut(),
+    fn prepare_foreign_notifier(&mut self, foreign_notifier_src: &Source) {
+        if !foreign_notifier_src.is_installed().unwrap() {
+            self.source_map.borrow_mut().add_source(
+                foreign_notifier_src.inner.clone(),
+                self.submission_queue.clone(),
             );
-
-            match &mut *eventfd_src.source_type_mut() {
-                SourceType::ForeignNotifier(_, _, installed) => {
-                    *installed = self.submit_sqes().is_ok();
-                    *installed
-                }
-                _ => unreachable!("Expected ForeignNotifier source type"),
-            }
-        } else {
-            false
+            self.submission_queue
+                .borrow_mut()
+                .submissions
+                .push_front(foreign_notifier_src.inner.clone());
         }
     }
 }
@@ -1383,11 +1363,12 @@ pub(crate) struct Reactor {
 
     // This keeps the `eventfd` alive. Drop will close it when we're done
     notifier: Arc<sys::SleepNotifier>,
+
     // This is the source used to handle the notifications into the ring.
     // It is reused, unlike the timeout src, because it is possible and likely
     // that it will be in the ring through many calls to the reactor loop. It only ever gets
     // completed if this reactor is woken up from another one
-    eventfd_src: Source,
+    foreign_notifier_src: Source,
     source_map: Rc<RefCell<SourceMap>>,
 
     blocking_thread: BlockingThreadPool,
@@ -1492,7 +1473,7 @@ impl Reactor {
         let main_ring =
             SleepableRing::new(ring_depth, "main", allocator.clone(), source_map.clone())?;
         let poll_ring = PollRing::new(ring_depth, allocator.clone(), source_map.clone())?;
-        let mut latency_ring =
+        let latency_ring =
             SleepableRing::new(ring_depth, "latency", allocator.clone(), source_map.clone())?;
 
         match main_ring.registrar().register_buffers_by_ref(&registry) {
@@ -1528,16 +1509,12 @@ impl Reactor {
 
         let link_fd = latency_ring.ring_fd();
 
-        let eventfd_src = Source::new(
+        let foreign_notifier_src = Source::new(
             IoRequirements::default(),
             SourceType::ForeignNotifier(notifier.eventfd_fd(), 0, false),
             None,
             None,
         );
-
-        if !eventfd_src.is_installed().unwrap() {
-            latency_ring.install_eventfd(&eventfd_src);
-        }
 
         Ok(Reactor {
             main_ring: RefCell::new(main_ring),
@@ -1548,7 +1525,7 @@ impl Reactor {
             blocking_thread: BlockingThreadPool::new(thread_pool_placement, notifier.clone())?,
             link_fd,
             notifier,
-            eventfd_src,
+            foreign_notifier_src,
             source_map,
             rings_depth: ring_depth,
         })
@@ -1560,14 +1537,6 @@ impl Reactor {
 
     pub(crate) fn ring_depth(&self) -> usize {
         self.rings_depth
-    }
-
-    pub(crate) fn install_eventfd(&self) {
-        if !self.eventfd_src.is_installed().unwrap() {
-            self.latency_ring
-                .borrow_mut()
-                .install_eventfd(&self.eventfd_src);
-        }
     }
 
     pub(crate) fn process_foreign_wakes(&self) -> usize {
@@ -2013,9 +1982,12 @@ impl Reactor {
         self.throughput_preemption_timeout_src.replace(Some(
             main_ring.prepare_throughput_preemption_timer(
                 self.ring_depth() as u32,
-                self.eventfd_src.raw(),
+                self.foreign_notifier_src.raw(),
             ),
         ));
+
+        // Prepare the foreign notifier
+        lat_ring.prepare_foreign_notifier(&self.foreign_notifier_src);
 
         flush_cancellations!(into &mut woke; lat_ring, poll_ring, main_ring);
         flush_rings!(lat_ring, poll_ring, main_ring)?;
@@ -2048,7 +2020,7 @@ impl Reactor {
             membarrier::heavy();
             let events = process_remote_channels() + self.flush_syscall_thread();
             if events == 0 {
-                if self.eventfd_src.is_installed().unwrap() {
+                if self.foreign_notifier_src.is_installed().unwrap() {
                     self.link_rings_and_sleep(&mut main_ring)
                         .expect("some error");
                     // May have new cancellations related to the link ring fd.
@@ -2062,6 +2034,7 @@ impl Reactor {
         }
 
         if let Some(preempt) = preempt_timer() {
+            lat_ring.prepare_foreign_notifier(&self.foreign_notifier_src);
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
             assert!(force_flush_rings!(into &mut 0; 1, lat_ring, main_ring) > 0);
