@@ -1,17 +1,15 @@
 use crate::{
     free_list::{FreeList, Idx},
-    sys::{
-        io_scheduler::FIFOScheduler,
-        source::PinnedInnerSource,
-        EnqueuedSource,
-        EnqueuedStatus,
-        InnerSource,
-    },
+    sys::{io_scheduler::FIFOScheduler, source::PinnedInnerSource, SourceStatus},
 };
 use alloc::rc::Rc;
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 
-pub(super) type SourceMap = FreeList<PinnedInnerSource>;
+pub(super) struct SourceMap {
+    map: FreeList<PinnedInnerSource>,
+    pub(super) scheduler: Rc<RefCell<FIFOScheduler>>,
+}
+
 pub(crate) type SourceId = Idx<PinnedInnerSource>;
 pub(super) fn from_user_data(user_data: u64) -> SourceId {
     SourceId::from_raw((user_data - 1) as usize)
@@ -21,37 +19,26 @@ pub(super) fn to_user_data(id: SourceId) -> u64 {
 }
 
 impl SourceMap {
-    pub(super) fn add_source(
-        &mut self,
-        src: PinnedInnerSource,
-        queue: Rc<RefCell<FIFOScheduler>>,
-    ) -> SourceId {
-        let id = self.alloc(src);
-        self.peek_source_mut(id, |mut src| {
-            src.enqueued.replace(EnqueuedSource {
-                id,
-                queue,
-                status: EnqueuedStatus::Enqueued,
-            });
-        });
+    pub(super) fn new(sched: &Rc<RefCell<FIFOScheduler>>) -> Self {
+        Self {
+            map: Default::default(),
+            scheduler: sched.clone(),
+        }
+    }
+
+    pub(super) fn add_source(&mut self, src: PinnedInnerSource) -> SourceId {
+        let id = self.map.alloc(src);
+        self.map[id]
+            .borrow_mut()
+            .status
+            .replace(SourceStatus::Dispatched(Rc::downgrade(&self.scheduler), id));
         id
     }
 
-    pub(super) fn peek_source_mut<R, Fn: for<'a> FnOnce(RefMut<'a, InnerSource>) -> R>(
-        &mut self,
-        id: SourceId,
-        f: Fn,
-    ) -> R {
-        f(self[id].borrow_mut())
-    }
+    pub(super) fn consume_source(&mut self, id: SourceId) -> PinnedInnerSource {
+        let source = self.map.dealloc(id);
+        source.borrow_mut().status.take();
 
-    pub(super) fn consume_source(
-        &mut self,
-        id: SourceId,
-    ) -> (PinnedInnerSource, Rc<RefCell<FIFOScheduler>>) {
-        let source = self.dealloc(id);
-        let enqueued = source.borrow_mut().enqueued.take();
-
-        (source, enqueued.unwrap().queue)
+        source
     }
 }

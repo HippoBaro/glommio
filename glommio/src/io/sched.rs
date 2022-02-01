@@ -129,7 +129,7 @@ impl FileScheduler {
                     .stats_collection()
                     .and_then(|x| x.reused)
                 {
-                    let mut ring = sys.ring_for_source(&sched_source.source);
+                    let mut ring = sys.ring_for_source(&sched_source.source.inner);
                     reused(&result, ring.io_stats_mut(), 1);
                     reused(
                         &result,

@@ -1,3 +1,4 @@
+use alloc::rc::Weak;
 use std::{
     cell::{Ref, RefCell},
     convert::TryFrom,
@@ -44,6 +45,7 @@ use crate::{
 };
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum SourceType {
     Write(RawFd, u64, PollableStatus, IoBuffer),
     Read(RawFd, u64, usize, PollableStatus, Option<IoBuffer>),
@@ -77,6 +79,7 @@ pub(crate) enum SourceType {
     Timeout(TimeSpec64, u32),
     Connect(RawFd, SockAddr),
     Accept(RawFd, SockAddrStorage),
+    LatencyPreemption(TimeSpec64, u32),
     ThroughputPreemption(RawFd, TimeSpec64, u32),
     Rename(PathBuf, PathBuf),
     CreateDir(PathBuf, Mode),
@@ -101,18 +104,16 @@ impl TryFrom<SourceType> for libc::statx {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-pub(crate) enum EnqueuedStatus {
-    Enqueued,
-    Canceled,
-    Dispatched,
-}
+#[derive(Debug, Clone)]
+pub(crate) enum SourceStatus {
+    /// The source is in transit through the kernel
+    Dispatched(Weak<RefCell<FIFOScheduler>>, SourceId),
 
-#[derive(Clone)]
-pub struct EnqueuedSource {
-    pub(crate) id: SourceId,
-    pub(crate) queue: Rc<RefCell<FIFOScheduler>>,
-    pub(crate) status: EnqueuedStatus,
+    /// The source was cancelled and a cancellation request was created
+    Cancelling(SourceId),
+
+    /// The source is cancelled
+    Canceled,
 }
 
 pub(crate) type StatsCollectionFn = fn(&io::Result<usize>, &mut RingIoStats, waiters: u64) -> ();
@@ -144,7 +145,7 @@ pub(crate) struct InnerSource {
 
     pub(crate) timeout: Option<TimeSpec64>,
 
-    pub(crate) enqueued: Option<EnqueuedSource>,
+    pub(crate) status: Option<SourceStatus>,
 
     pub(crate) stats_collection: Option<StatsCollection>,
 
@@ -162,7 +163,7 @@ impl InnerSource {
             wakers: Wakers::new(),
             source_type,
             io_requirements: ioreq,
-            enqueued: None,
+            status: None,
             timeout: None,
             stats_collection,
             task_queue,
@@ -200,15 +201,7 @@ impl Source {
         task_queue: Option<TaskQueueHandle>,
     ) -> Source {
         Source {
-            inner: Rc::pin(RefCell::new(InnerSource {
-                wakers: Wakers::new(),
-                source_type,
-                io_requirements: ioreq,
-                enqueued: None,
-                timeout: None,
-                stats_collection,
-                task_queue,
-            })),
+            inner: InnerSource::pin(ioreq, source_type, stats_collection, task_queue),
         }
     }
 
@@ -271,14 +264,14 @@ impl Source {
                     pre_lat,
                     io_lat,
                     post_lat,
-                    reactor.ring_for_source(self).io_stats_mut(),
+                    reactor.ring_for_source(&self.inner).io_stats_mut(),
                 );
                 (stat_fn)(
                     pre_lat,
                     io_lat,
                     post_lat,
                     reactor
-                        .ring_for_source(self)
+                        .ring_for_source(&self.inner)
                         .io_stats_for_task_queue_mut(crate::executor().current_task_queue()),
                 );
             }
@@ -362,34 +355,30 @@ impl Drop for Source {
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
         inner.wakers.waiters.clear();
-        let enqueued = inner.enqueued.as_mut();
-        if let Some(EnqueuedSource {
-            id: _,
-            queue,
-            status,
-        }) = enqueued
-        {
-            match status {
-                EnqueuedStatus::Enqueued => {
-                    // We never submitted the request, so it's safe to consume
-                    // source here -- kernel didn't see our buffers. By consuming
-                    // the source we are signaling to the submit method that we are
-                    // no longer interested in submitting this. This should be cheaper
-                    // than removing elements from the vector all the time.
+        inner.status = match &inner.status {
+            Some(SourceStatus::Dispatched(scheduler, id)) => {
+                // We are cancelling this request, but it is already submitted.
+                // This means that the kernel might be using the buffers right
+                // now, so we delay `consume_source` until we consume the
+                // corresponding event from the completion queue.
 
-                    *status = EnqueuedStatus::Canceled;
+                if let Some(scheduler) = scheduler.upgrade() {
+                    scheduler.borrow_mut().cancel(&self.inner);
+                    Some(SourceStatus::Cancelling(*id))
+                } else {
+                    Some(SourceStatus::Canceled)
                 }
-                EnqueuedStatus::Dispatched => {
-                    // We are cancelling this request, but it is already submitted.
-                    // This means that the kernel might be using the buffers right
-                    // now, so we delay `consume_source` until we consume the
-                    // corresponding event from the completion queue.
-
-                    queue.borrow_mut().cancel(&self.inner);
-                    *status = EnqueuedStatus::Canceled; // not necessary, but useful for correctness
-                }
-                EnqueuedStatus::Canceled => unreachable!(),
             }
-        }
+            None => {
+                // We never submitted the request, so it's safe to consume
+                // source here -- kernel didn't see our buffers. By consuming
+                // the source we are signaling to the submit method that we are
+                // no longer interested in submitting this. This should be cheaper
+                // than removing elements from the vector all the time.
+
+                Some(SourceStatus::Canceled)
+            }
+            _ => unreachable!(),
+        };
     }
 }

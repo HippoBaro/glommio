@@ -790,7 +790,7 @@ impl Reactor {
     }
 
     pub(crate) fn rush_dispatch(&self, source: &Source) -> io::Result<()> {
-        self.sys.rush_dispatch(source, &mut 0)
+        self.sys.rush_dispatch(source)
     }
 
     /// Polls for I/O, but does not change any timer registration.
