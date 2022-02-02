@@ -977,6 +977,7 @@ impl Drop for DmaStreamWriter {
             crate::executor()
                 .reactor()
                 .sys
+                .borrow_mut()
                 .async_truncate(file.as_raw_fd(), state.flushed_pos());
         }
     }

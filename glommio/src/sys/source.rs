@@ -259,7 +259,8 @@ impl Source {
                 let io_lat = lat.fulfilled_at - lat.submitted_at;
                 let post_lat = lat.fulfilled_at.elapsed();
 
-                let reactor = &crate::executor().reactor().sys;
+                let reactor = crate::executor().reactor();
+                let mut reactor = reactor.sys.borrow_mut();
                 (stat_fn)(
                     pre_lat,
                     io_lat,

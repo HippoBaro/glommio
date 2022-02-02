@@ -169,7 +169,7 @@ impl Timers {
 /// [`Local::get_reactor()`].
 pub(crate) struct Reactor {
     /// Raw bindings to `epoll`/`kqueue`/`wepoll`.
-    pub(crate) sys: sys::Reactor,
+    pub(crate) sys: Rc<RefCell<sys::Reactor>>,
 
     timers: RefCell<Timers>,
 
@@ -203,7 +203,7 @@ impl Reactor {
         let sys = sys::Reactor::new(notifier, io_memory, ring_depth, thread_pool_placement)?;
         let (preempt_ptr_head, preempt_ptr_tail) = sys.preempt_pointers();
         Ok(Reactor {
-            sys,
+            sys: Rc::new(RefCell::new(sys)),
             timers: RefCell::new(Timers::new()),
             shared_channels: RefCell::new(SharedChannels::new()),
             io_scheduler: Rc::new(IoScheduler::new()),
@@ -214,11 +214,11 @@ impl Reactor {
     }
 
     pub(crate) fn io_stats(&self) -> IoStats {
-        self.sys.io_stats()
+        self.sys.borrow_mut().io_stats()
     }
 
     pub(crate) fn task_queue_io_stats(&self, handle: &TaskQueueHandle) -> Option<IoStats> {
-        self.sys.task_queue_io_stats(handle)
+        self.sys.borrow_mut().task_queue_io_stats(handle)
     }
 
     #[inline(always)]
@@ -227,11 +227,11 @@ impl Reactor {
     }
 
     pub(crate) fn id(&self) -> usize {
-        self.sys.id()
+        self.sys.borrow_mut().id()
     }
 
     pub(crate) fn ring_depth(&self) -> usize {
-        self.sys.ring_depth()
+        self.sys.borrow_mut().ring_depth()
     }
 
     fn new_source(&self, stype: SourceType, stats_collection: Option<StatsCollection>) -> Source {
@@ -282,7 +282,7 @@ impl Reactor {
     }
 
     pub(crate) fn alloc_dma_buffer(&self, size: usize) -> DmaBuffer {
-        self.sys.alloc_dma_buffer(size)
+        self.sys.borrow_mut().alloc_dma_buffer(size)
     }
 
     pub(crate) fn write_dma(
@@ -307,7 +307,7 @@ impl Reactor {
             SourceType::Write(fd, pos, pollable, IoBuffer::Dma(buf)),
             Some(stats),
         );
-        self.sys.write_dma(&source);
+        self.sys.borrow_mut().write_dma(&source);
         source
     }
 
@@ -332,33 +332,33 @@ impl Reactor {
             ),
             Some(stats),
         );
-        self.sys.write_buffered(&source);
+        self.sys.borrow_mut().write_buffered(&source);
         source
     }
 
     pub(crate) fn connect(&self, fd: RawFd, addr: SockAddr) -> Source {
         let source = self.new_source(SourceType::Connect(fd, addr), None);
-        self.sys.connect(&source);
+        self.sys.borrow_mut().connect(&source);
         source
     }
 
     pub(crate) fn connect_timeout(&self, fd: RawFd, addr: SockAddr, d: Duration) -> Source {
         let source = self.new_source(SourceType::Connect(fd, addr), None);
         source.set_timeout(d);
-        self.sys.connect(&source);
+        self.sys.borrow_mut().connect(&source);
         source
     }
 
     pub(crate) fn accept(&self, fd: RawFd) -> Source {
         let addr = SockAddrStorage::uninit();
         let source = self.new_source(SourceType::Accept(fd, addr), None);
-        self.sys.accept(&source);
+        self.sys.borrow_mut().accept(&source);
         source
     }
 
     pub(crate) fn poll_read_ready(&self, fd: RawFd) -> Source {
         let source = self.new_source(SourceType::PollAdd(fd, common_flags() | read_flags()), None);
-        self.sys.poll_ready(&source);
+        self.sys.borrow_mut().poll_ready(&source);
         source
     }
 
@@ -367,7 +367,7 @@ impl Reactor {
             SourceType::PollAdd(fd, common_flags() | write_flags()),
             None,
         );
-        self.sys.poll_ready(&source);
+        self.sys.borrow_mut().poll_ready(&source);
         source
     }
 
@@ -381,7 +381,7 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.send(&source);
+        self.sys.borrow_mut().send(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -417,7 +417,7 @@ impl Reactor {
             source.set_timeout(timeout);
         }
 
-        self.sys.sendmsg(&source);
+        self.sys.borrow_mut().sendmsg(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -457,7 +457,7 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.recvmsg(&source);
+        self.sys.borrow_mut().recvmsg(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -475,14 +475,14 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.recv(&source);
+        self.sys.borrow_mut().recv(&source);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
 
     pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: MsgFlags) -> Source {
         let source = self.new_source(SourceType::SockRecv(fd, size, None, flags), None);
-        self.sys.recv(&source);
+        self.sys.borrow_mut().recv(&source);
         source
     }
 
@@ -524,17 +524,18 @@ impl Reactor {
 
         let source = self.new_source(SourceType::Read(fd, pos, size, pollable, None), Some(stats));
 
+        let mut reactor = self.sys.borrow_mut();
         if let Some(scheduler) = scheduler {
             if let Some(source) =
-                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
+                scheduler.consume_scheduled(pos..pos + size as u64, Some(&mut *reactor))
             {
                 source
             } else {
-                self.sys.read_dma(&source);
+                reactor.read_dma(&source);
                 scheduler.schedule(source, pos..pos + size as u64)
             }
         } else {
-            self.sys.read_dma(&source);
+            reactor.read_dma(&source);
             ScheduledSource::new_raw(source, pos..pos + size as u64)
         }
     }
@@ -581,23 +582,23 @@ impl Reactor {
         );
 
         if let Some(scheduler) = scheduler {
-            if let Some(source) =
-                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
+            if let Some(source) = scheduler
+                .consume_scheduled(pos..pos + size as u64, Some(&mut *self.sys.borrow_mut()))
             {
                 source
             } else {
-                self.sys.read_buffered(&source);
+                self.sys.borrow_mut().read_buffered(&source);
                 scheduler.schedule(source, pos..pos + size as u64)
             }
         } else {
-            self.sys.read_buffered(&source);
+            self.sys.borrow_mut().read_buffered(&source);
             ScheduledSource::new_raw(source, pos..pos + size as u64)
         }
     }
 
     pub(crate) fn fdatasync(&self, fd: RawFd) -> Source {
         let source = self.new_source(SourceType::FdataSync(fd), None);
-        self.sys.fdatasync(&source);
+        self.sys.borrow_mut().fdatasync(&source);
         source
     }
 
@@ -617,13 +618,13 @@ impl Reactor {
             ),
             None,
         );
-        self.sys.fallocate(&source);
+        self.sys.borrow_mut().fallocate(&source);
         source
     }
 
     pub(crate) fn truncate(&self, fd: RawFd, size: u64) -> Source {
         let source = self.new_source(SourceType::Truncate(fd, size as usize), None);
-        self.sys.truncate(&source, size);
+        self.sys.borrow_mut().truncate(&source, size);
         source
     }
 
@@ -636,13 +637,13 @@ impl Reactor {
             SourceType::Rename(old_path.as_ref().to_owned(), new_path.as_ref().to_owned()),
             None,
         );
-        self.sys.rename(&source);
+        self.sys.borrow_mut().rename(&source);
         source
     }
 
     pub(crate) fn remove_file<P: AsRef<Path>>(&self, path: P) -> Source {
         let source = self.new_source(SourceType::Remove(path.as_ref().to_owned()), None);
-        self.sys.remove_file(&source);
+        self.sys.borrow_mut().remove_file(&source);
         source
     }
 
@@ -654,13 +655,13 @@ impl Reactor {
             ),
             None,
         );
-        self.sys.create_dir(&source);
+        self.sys.borrow_mut().create_dir(&source);
         source
     }
 
     pub(crate) fn run_blocking(&self, func: Box<dyn FnOnce() + Send + 'static>) -> Source {
         let source = self.new_source(SourceType::BlockingFn, None);
-        self.sys.run_blocking(&source, func);
+        self.sys.borrow_mut().run_blocking(&source, func);
         source
     }
 
@@ -677,7 +678,7 @@ impl Reactor {
                 latency: None,
             }),
         );
-        self.sys.close(&source);
+        self.sys.borrow_mut().close(&source);
         source
     }
 
@@ -693,7 +694,7 @@ impl Reactor {
             SourceType::Statx(fd, path, Box::new(RefCell::new(statx_buf))),
             None,
         );
-        self.sys.statx(&source);
+        self.sys.borrow_mut().statx(&source);
         source
     }
 
@@ -723,14 +724,14 @@ impl Reactor {
                 latency: None,
             }),
         );
-        self.sys.open_at(&source);
+        self.sys.borrow_mut().open_at(&source);
         source
     }
 
     #[cfg(feature = "bench")]
     pub(crate) fn nop(&self) -> Source {
         let source = self.new_source(SourceType::Noop, None);
-        self.sys.nop(&source);
+        self.sys.borrow_mut().nop(&source);
         source
     }
 
@@ -771,9 +772,7 @@ impl Reactor {
 
     fn process_shared_channels(&self) -> usize {
         let mut channels = self.shared_channels.borrow_mut();
-        let mut processed = channels.process_shared_channels();
-        processed += self.sys.process_foreign_wakes();
-        processed
+        channels.process_shared_channels()
     }
 
     pub(crate) fn process_shared_channels_by_id(&self, id: u64) -> usize {
@@ -790,7 +789,7 @@ impl Reactor {
     }
 
     pub(crate) fn rush_dispatch(&self, source: &Source) -> io::Result<()> {
-        self.sys.rush_dispatch(source)
+        self.sys.borrow_mut().rush_dispatch(source)
     }
 
     /// Polls for I/O, but does not change any timer registration.
@@ -798,7 +797,7 @@ impl Reactor {
     /// This doesn't ever sleep, and does not touch the preemption timer.
     pub(crate) fn spin_poll_io(&self) -> io::Result<bool> {
         let mut woke = 0;
-        self.sys.poll_io(&mut woke)?;
+        self.sys.borrow_mut().poll_io(&mut woke)?;
         woke += self.process_timers().1;
         woke += self.process_shared_channels();
 
@@ -808,6 +807,7 @@ impl Reactor {
     fn process_external_events(&self) -> (Option<Duration>, usize) {
         let (next_timer, mut woke) = self.process_timers();
         woke += self.process_shared_channels();
+        woke += self.sys.borrow_mut().process_foreign_wakes();
         (next_timer, woke)
     }
 
@@ -817,10 +817,11 @@ impl Reactor {
         let (next_timer, woke) = self.process_external_events();
 
         // Block on I/O events.
-        match self
+        let res = self
             .sys
-            .wait(timeout, next_timer, woke, || self.process_shared_channels())
-        {
+            .borrow_mut()
+            .wait(timeout, next_timer, woke, || self.process_shared_channels());
+        match res {
             // Don't wait for the next loop to process timers or shared channels
             Ok(true) => {
                 self.process_external_events();

@@ -53,7 +53,7 @@ This is likely file, but in extreme situations can lead to resource exhaustion. 
                 file
             );
             if let Some(r) = self.reactor.upgrade() {
-                r.sys.async_close(file);
+                r.sys.borrow_mut().async_close(file);
             }
         }
     }

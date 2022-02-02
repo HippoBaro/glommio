@@ -5,7 +5,7 @@ use crate::{
 use alloc::rc::Rc;
 use std::cell::RefCell;
 
-pub(super) struct SourceMap {
+pub(crate) struct SourceMap {
     map: FreeList<PinnedInnerSource>,
     pub(super) scheduler: Rc<RefCell<FIFOScheduler>>,
 }
