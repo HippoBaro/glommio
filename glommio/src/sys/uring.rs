@@ -30,6 +30,7 @@ use crate::{
         io_scheduler::{FIFOScheduler, IOScheduler, IOSchedulerSession, IOSchedulerSessionState},
         source::PinnedInnerSource,
         source_map::{from_user_data, to_user_data, SourceMap},
+        uring::internal::Uring,
         DirectIo,
         InnerSource,
         IoBuffer,
@@ -323,11 +324,7 @@ fn transmute_error(res: io::Result<u32>) -> io::Result<usize> {
         })
 }
 
-fn record_stats<Ring: UringCommon>(
-    ring: &mut Ring,
-    src: &mut InnerSource,
-    res: &io::Result<usize>,
-) {
+fn record_stats<R: Ring>(ring: &mut R, src: &mut InnerSource, res: &io::Result<usize>) {
     src.wakers.fulfilled_at = Some(Instant::now());
     if let Some(fulfilled) = src.stats_collection.and_then(|x| x.fulfilled) {
         fulfilled(res, ring.io_stats_mut(), 1);
@@ -377,86 +374,105 @@ where
     None
 }
 
-pub(crate) trait UringCommon {
-    fn submit_sqes(&mut self) -> io::Result<usize>;
+mod internal {
+    use crate::{
+        iou,
+        sys::{io_scheduler::IOSchedulerSession, source_map::SourceMap, Reactor},
+    };
+    use log::warn;
+    use std::io;
 
-    fn force_submit_sqes(
-        &mut self,
-        source_map: &mut SourceMap,
-        woke: &mut usize,
-    ) -> io::Result<usize> {
-        let to_submit = self.waiting_kernel_submission();
+    pub(crate) trait Uring {
+        /// None if it wasn't possible to acquire an `sqe`. `Some(true)` if it
+        /// was possible and there was something to dispatch.
+        /// `Some(false)` if there was nothing to dispatch
+        fn submit_one_source(
+            &mut self,
+            source_map: &mut SourceMap,
+            session: &mut IOSchedulerSession<'_>,
+        ) -> Option<bool>;
 
-        // if we fail to submit we need to make sure we collect CQEs before sleeping
-        let mut consumed = false;
-        let mut submitted = 0;
-        loop {
-            submitted += self
-                .submit_sqes()
-                .or_else(Reactor::busy_ok)
-                .or_else(Reactor::again_ok)
-                .or_else(Reactor::intr_ok)?;
+        fn submit_sqes(&mut self) -> io::Result<usize>;
 
-            if submitted < to_submit && !consumed {
-                consumed = true;
-                self.consume_completion_queue(source_map, woke);
-                println!("consuming");
-            } else if submitted < to_submit {
-                warn!(
-                    "failed to flush the required minimum of events ({}/{}); waiting for CQEs",
-                    submitted, to_submit
-                );
-                self.wait_for_events(1)
-                    .expect("failed to wait for CQE. Game over");
-                self.consume_completion_queue(source_map, woke);
-            } else {
-                break;
+        fn force_submit_sqes(
+            &mut self,
+            source_map: &mut SourceMap,
+            woke: &mut usize,
+        ) -> io::Result<usize> {
+            let to_submit = self.waiting_kernel_submission();
+            if to_submit == 0 {
+                return Ok(0);
             }
-        }
 
-        Ok(submitted)
-    }
+            // if we fail to submit we need to make sure we collect CQEs before sleeping
+            let mut consumed = false;
+            let mut submitted = 0;
+            loop {
+                submitted += self
+                    .submit_sqes()
+                    .or_else(Reactor::busy_ok)
+                    .or_else(Reactor::again_ok)
+                    .or_else(Reactor::intr_ok)?;
 
-    fn submit_wait_sqes(&mut self, wait: u32) -> io::Result<usize>;
-    fn waiting_kernel_submission(&self) -> usize;
-    fn in_kernel(&self) -> usize;
-    fn waiting_kernel_collection(&self) -> usize;
-    fn needs_kernel_enter(&self) -> bool;
-    fn can_sleep(&self) -> bool;
-    /// None if it wasn't possible to acquire an `sqe`. `Some(true)` if it was
-    /// possible and there was something to dispatch. `Some(false)` if there
-    /// was nothing to dispatch
-    fn submit_one_source(
-        &mut self,
-        source_map: &mut SourceMap,
-        session: &mut IOSchedulerSession<'_, FIFOScheduler>,
-    ) -> Option<bool>;
-    /// Return `None` if no event is completed, `Some(true)` for a task is woken
-    /// up and `Some(false)` for not.
-    fn consume_one_event(&mut self, source_map: &mut SourceMap) -> Option<bool>;
-    fn wait_for_events(&mut self, events: u32) -> io::Result<()>;
-    fn name(&self) -> &'static str;
-    fn io_stats_mut(&mut self) -> &mut RingIoStats;
-    fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats;
-    fn registrar(&self) -> iou::Registrar<'_>;
-    fn may_rush(&self) -> bool {
-        true
-    }
-
-    fn consume_completion_queue(&mut self, source_map: &mut SourceMap, woke: &mut usize) -> usize {
-        let mut completed = 0;
-        loop {
-            match self.consume_one_event(source_map) {
-                None => break,
-                Some(false) => completed += 1,
-                Some(true) => {
-                    completed += 1;
-                    *woke += 1;
+                if submitted < to_submit && !consumed {
+                    consumed = true;
+                    self.consume_completion_queue(source_map, woke);
+                } else if submitted < to_submit {
+                    warn!(
+                        "failed to flush the required minimum of events ({}/{}); waiting for CQEs",
+                        submitted, to_submit
+                    );
+                    self.wait_for_events(1)
+                        .expect("failed to wait for CQE. Game over");
+                    self.consume_completion_queue(source_map, woke);
+                } else {
+                    break;
                 }
             }
+
+            Ok(submitted)
         }
-        completed
+
+        fn submit_wait_sqes(&mut self, wait: u32) -> io::Result<usize>;
+        fn waiting_kernel_submission(&self) -> usize;
+        fn in_kernel(&self) -> usize;
+        fn waiting_kernel_collection(&self) -> usize;
+        fn needs_kernel_enter(&self) -> bool;
+        fn can_sleep(&self) -> bool;
+        /// Return `None` if no event is completed, `Some(true)` for a task is
+        /// woken up and `Some(false)` for not.
+        fn consume_one_event(&mut self, source_map: &mut SourceMap) -> Option<bool>;
+        fn wait_for_events(&mut self, events: u32) -> io::Result<()>;
+        fn name(&self) -> &'static str;
+        fn registrar(&self) -> iou::Registrar<'_>;
+        fn may_rush(&self) -> bool {
+            true
+        }
+
+        fn consume_completion_queue(
+            &mut self,
+            source_map: &mut SourceMap,
+            woke: &mut usize,
+        ) -> usize {
+            let mut completed = 0;
+            loop {
+                match self.consume_one_event(source_map) {
+                    None => break,
+                    Some(false) => completed += 1,
+                    Some(true) => {
+                        completed += 1;
+                        *woke += 1;
+                    }
+                }
+            }
+            completed
+        }
     }
+}
+
+pub(crate) trait Ring: internal::Uring {
+    fn io_stats_mut(&mut self) -> &mut RingIoStats;
+    fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats;
 }
 
 struct PollRing {
@@ -490,17 +506,50 @@ impl PollRing {
     }
 }
 
-impl UringCommon for PollRing {
-    fn name(&self) -> &'static str {
-        "poll"
-    }
-
+impl Ring for PollRing {
     fn io_stats_mut(&mut self) -> &mut RingIoStats {
         &mut self.stats
     }
 
     fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats {
         self.task_queue_stats.entry(handle).or_default()
+    }
+}
+
+impl internal::Uring for PollRing {
+    fn submit_one_source(
+        &mut self,
+        source_map: &mut SourceMap,
+        session: &mut IOSchedulerSession<'_>,
+    ) -> Option<bool> {
+        let mut sq = self.ring.sq();
+
+        let sqes = session
+            .peek()
+            .map(|src| sq.prepare_sqes(sqe_required(src) as u32));
+
+        match sqes {
+            Some(Some(sqes)) => {
+                let src = session.pop().unwrap();
+                let mut x = src.borrow_mut();
+                x.wakers.submitted_at = Some(Instant::now());
+                if let Some(SourceStatus::Canceled) = x.status {
+                    return Some(true);
+                }
+                drop(x);
+
+                // we are golden
+                source_map.add_source(src.clone());
+                prepare_one_source(src, sqes, |size| self.allocator.new_buffer(size));
+                Some(true)
+            }
+            Some(None) => None,  // No SQEs available
+            None => Some(false), // No source to prepare
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "poll"
     }
 
     fn registrar(&self) -> iou::Registrar<'_> {
@@ -531,9 +580,13 @@ impl UringCommon for PollRing {
     }
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
-        let x = self.ring.submit_sqes()? as usize;
-        self.in_kernel += x;
-        Ok(x)
+        if self.needs_kernel_enter() {
+            let x = self.ring.submit_sqes()? as usize;
+            self.in_kernel += x;
+            Ok(x)
+        } else {
+            Ok(0)
+        }
     }
 
     fn submit_wait_sqes(&mut self, _: u32) -> io::Result<usize> {
@@ -557,37 +610,6 @@ impl UringCommon for PollRing {
 
     fn wait_for_events(&mut self, events: u32) -> io::Result<()> {
         self.ring.cq().wait(events)
-    }
-
-    fn submit_one_source(
-        &mut self,
-        source_map: &mut SourceMap,
-        session: &mut IOSchedulerSession<'_, FIFOScheduler>,
-    ) -> Option<bool> {
-        let mut sq = self.ring.sq();
-
-        let sqes = session
-            .peek()
-            .map(|src| sq.prepare_sqes(sqe_required(src) as u32));
-
-        match sqes {
-            Some(Some(sqes)) => {
-                let src = session.pop().unwrap();
-                let mut x = src.borrow_mut();
-                x.wakers.submitted_at = Some(Instant::now());
-                if let Some(SourceStatus::Canceled) = x.status {
-                    return Some(true);
-                }
-                drop(x);
-
-                // we are golden
-                source_map.add_source(src.clone());
-                prepare_one_source(src, sqes, |size| self.allocator.new_buffer(size));
-                Some(true)
-            }
-            Some(None) => None,  // No SQEs available
-            None => Some(false), // No source to prepare
-        }
     }
 }
 
@@ -624,17 +646,50 @@ impl SleepableRing {
     }
 }
 
-impl UringCommon for SleepableRing {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
+impl Ring for SleepableRing {
     fn io_stats_mut(&mut self) -> &mut RingIoStats {
         &mut self.stats
     }
 
     fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats {
         self.task_queue_stats.entry(handle).or_default()
+    }
+}
+
+impl internal::Uring for SleepableRing {
+    fn submit_one_source(
+        &mut self,
+        source_map: &mut SourceMap,
+        session: &mut IOSchedulerSession<'_>,
+    ) -> Option<bool> {
+        let mut sq = self.ring.sq();
+
+        let sqes = session
+            .peek()
+            .map(|src| sq.prepare_sqes(sqe_required(src) as u32));
+
+        match sqes {
+            Some(Some(sqes)) => {
+                let src = session.pop().unwrap();
+                let mut x = src.borrow_mut();
+                x.wakers.submitted_at = Some(Instant::now());
+                if let Some(SourceStatus::Canceled) = x.status {
+                    return Some(true);
+                }
+                drop(x);
+
+                // we are golden
+                source_map.add_source(src.clone());
+                prepare_one_source(src, sqes, |size| self.allocator.new_buffer(size));
+                Some(true)
+            }
+            Some(None) => None,  // No SQEs available
+            None => Some(false), // No source to prepare
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 
     fn registrar(&self) -> iou::Registrar<'_> {
@@ -668,9 +723,13 @@ impl UringCommon for SleepableRing {
     }
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
-        let x = self.ring.submit_sqes()? as usize;
-        self.in_kernel += x;
-        Ok(x)
+        if self.needs_kernel_enter() {
+            let x = self.ring.submit_sqes()? as usize;
+            self.in_kernel += x;
+            Ok(x)
+        } else {
+            Ok(0)
+        }
     }
 
     fn submit_wait_sqes(&mut self, wait: u32) -> io::Result<usize> {
@@ -699,37 +758,6 @@ impl UringCommon for SleepableRing {
 
     fn wait_for_events(&mut self, events: u32) -> io::Result<()> {
         self.ring.cq().wait(events)
-    }
-
-    fn submit_one_source(
-        &mut self,
-        source_map: &mut SourceMap,
-        session: &mut IOSchedulerSession<'_, FIFOScheduler>,
-    ) -> Option<bool> {
-        let mut sq = self.ring.sq();
-
-        let sqes = session
-            .peek()
-            .map(|src| sq.prepare_sqes(sqe_required(src) as u32));
-
-        match sqes {
-            Some(Some(sqes)) => {
-                let src = session.pop().unwrap();
-                let mut x = src.borrow_mut();
-                x.wakers.submitted_at = Some(Instant::now());
-                if let Some(SourceStatus::Canceled) = x.status {
-                    return Some(true);
-                }
-                drop(x);
-
-                // we are golden
-                source_map.add_source(src.clone());
-                prepare_one_source(src, sqes, |size| self.allocator.new_buffer(size));
-                Some(true)
-            }
-            Some(None) => None,  // No SQEs available
-            None => Some(false), // No source to prepare
-        }
     }
 }
 
@@ -782,6 +810,32 @@ macro_rules! consume_rings {
             consumed += $ring.consume_completion_queue($source_map, $woke);
         )*
         consumed
+    }}
+}
+
+macro_rules! force_flush_rings {
+    (into $woke:expr; $source_map:expr, $( $ring:expr ),+ ) => {{
+        let mut ret = 0;
+        $(
+            ret += $ring.force_submit_sqes($source_map, $woke)
+                .or_else(Reactor::busy_ok)
+                .or_else(Reactor::again_ok)
+                .or_else(Reactor::intr_ok)?;
+        )*
+        io::Result::Ok(ret)
+    }}
+}
+
+macro_rules! flush_rings {
+    ($( $ring:expr ),+ ) => {{
+        let mut ret = 0;
+        $(
+            ret += $ring.submit_sqes()
+                .or_else(Reactor::busy_ok)
+                .or_else(Reactor::again_ok)
+                .or_else(Reactor::intr_ok)?;
+        )*
+        io::Result::Ok(ret)
     }}
 }
 
@@ -939,7 +993,7 @@ impl Reactor {
                     // Escape the borrow-checker
                     // The lifetime of the source_map and the rings are the same
                     let (ring, source_map) = unsafe {
-                        let ring = (self.ring_for_source(src) as *const _) as *mut dyn UringCommon;
+                        let ring = (self.ring_for_source(src) as *const _) as *mut dyn Ring;
                         let source_map = (&self.source_map as *const _) as *mut SourceMap;
                         (&mut *ring, &mut *source_map)
                     };
@@ -956,56 +1010,17 @@ impl Reactor {
 
             match status {
                 IOSchedulerSessionState::NeedsDrain => {
-                    if self.main_ring.needs_kernel_enter() {
-                        submitted += self
-                            .main_ring
-                            .force_submit_sqes(&mut self.source_map, woke)
-                            .or_else(Reactor::busy_ok)
-                            .or_else(Reactor::again_ok)
-                            .or_else(Reactor::intr_ok)?;
-                    }
-                    if self.poll_ring.needs_kernel_enter() {
-                        submitted += self
-                            .poll_ring
-                            .force_submit_sqes(&mut self.source_map, woke)
-                            .or_else(Reactor::busy_ok)
-                            .or_else(Reactor::again_ok)
-                            .or_else(Reactor::intr_ok)?;
-                    }
-                    if self.latency_ring.needs_kernel_enter() {
-                        submitted += self
-                            .latency_ring
-                            .force_submit_sqes(&mut self.source_map, woke)
-                            .or_else(Reactor::busy_ok)
-                            .or_else(Reactor::again_ok)
-                            .or_else(Reactor::intr_ok)?;
-                    }
+                    // We need to make sure the previous sources are dispatched immediately
+                    submitted += force_flush_rings!(
+                        into woke;
+                        &mut self.source_map,
+                        self.main_ring,
+                        self.poll_ring,
+                        self.latency_ring
+                    )?;
                 }
                 _ => {
-                    if self.main_ring.needs_kernel_enter() {
-                        submitted += self
-                            .main_ring
-                            .submit_sqes()
-                            .or_else(Reactor::busy_ok)
-                            .or_else(Reactor::again_ok)
-                            .or_else(Reactor::intr_ok)?;
-                    }
-                    if self.poll_ring.needs_kernel_enter() {
-                        submitted += self
-                            .poll_ring
-                            .submit_sqes()
-                            .or_else(Reactor::busy_ok)
-                            .or_else(Reactor::again_ok)
-                            .or_else(Reactor::intr_ok)?;
-                    }
-                    if self.latency_ring.needs_kernel_enter() {
-                        submitted += self
-                            .latency_ring
-                            .submit_sqes()
-                            .or_else(Reactor::busy_ok)
-                            .or_else(Reactor::again_ok)
-                            .or_else(Reactor::intr_ok)?;
-                    }
+                    submitted += flush_rings!(self.main_ring, self.poll_ring, self.latency_ring)?;
                     break;
                 }
             }
@@ -1382,7 +1397,7 @@ impl Reactor {
         ));
     }
 
-    pub(crate) fn ring_for_source(&mut self, source: &PinnedInnerSource) -> &mut dyn UringCommon {
+    pub(crate) fn ring_for_source(&mut self, source: &PinnedInnerSource) -> &mut dyn Ring {
         // Dispatch requests according to the following rules:
         // * Disk reads/writes go to the poll ring if possible, or the main ring
         //   otherwise;

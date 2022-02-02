@@ -27,8 +27,9 @@ use nix::{
 //
 use crate::{
     iou::sqe::{SockAddr, SockAddrStorage},
+    sys,
     sys::{
-        io_scheduler::{FIFOScheduler, IOScheduler},
+        io_scheduler::IOScheduler,
         source_map::SourceId,
         DmaBuffer,
         IoBuffer,
@@ -104,10 +105,10 @@ impl TryFrom<SourceType> for libc::statx {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum SourceStatus {
     /// The source is in transit through the kernel
-    Dispatched(Weak<RefCell<FIFOScheduler>>, SourceId),
+    Dispatched(Weak<RefCell<dyn IOScheduler>>, SourceId),
 
     /// The source was cancelled and a cancellation request was created
     Cancelling(SourceId),
@@ -261,19 +262,13 @@ impl Source {
 
                 let reactor = crate::executor().reactor();
                 let mut reactor = reactor.sys.borrow_mut();
+                let ring: &mut dyn sys::Ring = reactor.ring_for_source(&self.inner);
+                (stat_fn)(pre_lat, io_lat, post_lat, ring.io_stats_mut());
                 (stat_fn)(
                     pre_lat,
                     io_lat,
                     post_lat,
-                    reactor.ring_for_source(&self.inner).io_stats_mut(),
-                );
-                (stat_fn)(
-                    pre_lat,
-                    io_lat,
-                    post_lat,
-                    reactor
-                        .ring_for_source(&self.inner)
-                        .io_stats_for_task_queue_mut(crate::executor().current_task_queue()),
+                    ring.io_stats_for_task_queue_mut(crate::executor().current_task_queue()),
                 );
             }
         }

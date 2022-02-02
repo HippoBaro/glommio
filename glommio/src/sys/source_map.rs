@@ -1,8 +1,12 @@
 use crate::{
     free_list::{FreeList, Idx},
-    sys::{io_scheduler::FIFOScheduler, source::PinnedInnerSource, SourceStatus},
+    sys::{
+        io_scheduler::{FIFOScheduler, IOScheduler},
+        source::PinnedInnerSource,
+        SourceStatus,
+    },
 };
-use alloc::rc::Rc;
+use alloc::rc::{Rc, Weak};
 use std::cell::RefCell;
 
 pub(crate) struct SourceMap {
@@ -31,7 +35,10 @@ impl SourceMap {
         self.map[id]
             .borrow_mut()
             .status
-            .replace(SourceStatus::Dispatched(Rc::downgrade(&self.scheduler), id));
+            .replace(SourceStatus::Dispatched(
+                Rc::downgrade(&self.scheduler) as Weak<RefCell<dyn IOScheduler>>,
+                id,
+            ));
         id
     }
 

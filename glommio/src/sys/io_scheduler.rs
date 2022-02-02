@@ -69,7 +69,7 @@ mod internal {
 }
 
 /// An IO scheduler decides what requests go to the reactor and when
-pub(crate) trait IOScheduler: internal::IOSchedulerPrivate + Default {
+pub(crate) trait IOScheduler: internal::IOSchedulerPrivate {
     /// Whether there are any request queued up in the scheduler
     fn is_empty(&self) -> bool;
 
@@ -92,7 +92,7 @@ pub(crate) trait IOScheduler: internal::IOSchedulerPrivate + Default {
 
     /// Create a scheduler session
     /// A session is needed to pop and peek inside the scheduler.
-    fn open_session(&mut self) -> IOSchedulerSession<'_, Self>;
+    fn open_session(&mut self) -> IOSchedulerSession<'_>;
 }
 
 /// A FIFO scheduler that doesn't prioritize any requests except for
@@ -166,7 +166,7 @@ impl IOScheduler for FIFOScheduler {
         // doesn't do anything for now
     }
 
-    fn open_session(&mut self) -> IOSchedulerSession<'_, Self> {
+    fn open_session(&mut self) -> IOSchedulerSession<'_> {
         IOSchedulerSession {
             sched: self,
             should_drain: false,
@@ -193,19 +193,19 @@ pub(super) enum IOSchedulerSessionState {
 /// A scheduler session is used to pull requests from a scheduler.
 /// Once it is closed, the session returns a state that indicates to the rector
 /// what to do next.
-pub(crate) struct IOSchedulerSession<'a, Sched: IOScheduler + ?Sized> {
-    sched: &'a mut Sched,
+pub(crate) struct IOSchedulerSession<'a> {
+    sched: &'a mut dyn IOScheduler,
     should_drain: bool,
     sealed: bool,
 }
 
-impl<'a, Sched: IOScheduler + ?Sized> Drop for IOSchedulerSession<'a, Sched> {
+impl<'a> Drop for IOSchedulerSession<'a> {
     fn drop(&mut self) {
         assert!(self.sealed, "dropping without sealing is illegal");
     }
 }
 
-impl<'a, Sched: IOScheduler> IOSchedulerSession<'a, Sched> {
+impl<'a> IOSchedulerSession<'a> {
     pub(super) fn peek(&self) -> Option<&PinnedInnerSource> {
         self.sched
             .peek()

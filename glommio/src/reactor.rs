@@ -524,18 +524,17 @@ impl Reactor {
 
         let source = self.new_source(SourceType::Read(fd, pos, size, pollable, None), Some(stats));
 
-        let mut reactor = self.sys.borrow_mut();
         if let Some(scheduler) = scheduler {
             if let Some(source) =
-                scheduler.consume_scheduled(pos..pos + size as u64, Some(&mut *reactor))
+                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
             {
                 source
             } else {
-                reactor.read_dma(&source);
+                self.sys.borrow_mut().read_dma(&source);
                 scheduler.schedule(source, pos..pos + size as u64)
             }
         } else {
-            reactor.read_dma(&source);
+            self.sys.borrow_mut().read_dma(&source);
             ScheduledSource::new_raw(source, pos..pos + size as u64)
         }
     }
@@ -582,8 +581,8 @@ impl Reactor {
         );
 
         if let Some(scheduler) = scheduler {
-            if let Some(source) = scheduler
-                .consume_scheduled(pos..pos + size as u64, Some(&mut *self.sys.borrow_mut()))
+            if let Some(source) =
+                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
             {
                 source
             } else {
