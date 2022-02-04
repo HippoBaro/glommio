@@ -957,11 +957,14 @@ impl Reactor {
     /// CQEs are available on the main ring. This timer is linked with a write
     /// to the latency ring's event fd such that this timer triggers a
     /// preemption via the latency ring.
-    fn prepare_throughput_preemption_timer(&self, min_events: u32, event_fd: RawFd) -> Source {
-        assert!(min_events >= 1, "min_events should be at least 1");
+    fn prepare_throughput_preemption_timer(&self) -> Source {
         let source = Source::new(
             IoRequirements::default(),
-            SourceType::ThroughputPreemption(event_fd, TimeSpec64::from(Duration::MAX), min_events),
+            SourceType::ThroughputPreemption(
+                self.foreign_notifier_src.raw(),
+                TimeSpec64::from(Duration::MAX),
+                16,
+            ),
             None,
             None,
         );
@@ -1224,6 +1227,7 @@ impl Reactor {
     }
 
     pub(crate) fn poll_io(&mut self, woke: &mut usize) -> io::Result<()> {
+        consume_rings!(into woke; &mut self.source_map, self.latency_ring, self.poll_ring, self.main_ring);
         self.consume_scheduler(woke)?;
         *woke += self.flush_syscall_thread();
         *woke += self.process_foreign_wakes();
@@ -1301,12 +1305,8 @@ impl Reactor {
 
         // Schedule the throughput-based timeout immediately: it won't matter if we end
         // up sleeping.
-        self.throughput_preemption_timeout_src.replace(Some(
-            self.prepare_throughput_preemption_timer(
-                self.ring_depth() as u32,
-                self.foreign_notifier_src.raw(),
-            ),
-        ));
+        self.throughput_preemption_timeout_src
+            .replace(Some(self.prepare_throughput_preemption_timer()));
 
         // Prepare the foreign notifier
         self.prepare_foreign_notifier(&self.foreign_notifier_src);
@@ -1323,13 +1323,12 @@ impl Reactor {
             && self.latency_ring.can_sleep();
 
         if should_sleep {
-            // We are about to go to sleep. It's ok to sleep, but if there
-            // is a timer set, we need to make sure we wake up to handle it.
-            if let Some(dur) = user_timer {
-                self.latency_preemption_timeout_src
-                    .set(Some(self.prepare_latency_preemption_timer(dur)));
-                assert!(self.consume_scheduler(&mut 0)? > 0);
-            }
+            self.latency_preemption_timeout_src
+                .set(Some(self.prepare_latency_preemption_timer(
+                    user_timer.unwrap_or_else(|| Duration::from_micros(500)),
+                )));
+            assert!(self.consume_scheduler(&mut 0)? > 0);
+
             // From this moment on the remote executors are aware that we are sleeping
             // We have to sweep the remote channels function once more because since
             // last time until now it could be that something happened in a remote executor
@@ -1346,7 +1345,6 @@ impl Reactor {
                 if self.foreign_notifier_src.is_installed().unwrap() {
                     self.link_rings_and_sleep().expect("some error");
                     // May have new cancellations related to the link ring fd.
-                    self.consume_scheduler(&mut 0)?;
                     consume_rings!(into &mut 0; &mut self.source_map, self.latency_ring, self.poll_ring, self.main_ring);
                 }
                 // Woke up, so no need to notify us anymore.
@@ -1492,24 +1490,24 @@ mod tests {
             )
         }
 
-        let fast = timeout_source(50);
+        let fast = timeout_source(10);
         reactor.schedule_source(&fast);
 
-        let slow = timeout_source(150);
+        let slow = timeout_source(25);
         reactor.schedule_source(&slow);
 
-        let lethargic = timeout_source(300);
+        let lethargic = timeout_source(50);
         reactor.schedule_source(&lethargic);
 
         let start = Instant::now();
         reactor.wait(|| None, None, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
-        assert!((50..100).contains(&elapsed_ms));
+        assert!((10..50).contains(&elapsed_ms));
 
         drop(slow); // Cancel this one.
 
         reactor.wait(|| None, None, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
-        assert!((300..350).contains(&elapsed_ms), "{}", elapsed_ms);
+        assert!((50..100).contains(&elapsed_ms), "{}", elapsed_ms);
     }
 }

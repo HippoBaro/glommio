@@ -2,6 +2,7 @@ use futures::future::{join, join_all};
 use futures_lite::AsyncWriteExt;
 use glommio::{
     enclose,
+    executor,
     io::{ImmutableFile, ImmutableFileBuilder},
     Latency,
     LocalExecutorBuilder,
@@ -17,7 +18,9 @@ use std::{
 };
 
 fn main() {
-    let handle = LocalExecutorBuilder::new(Placement::Fixed(0)).preempt_timer(Duration::from_millis(10))
+    let handle = LocalExecutorBuilder::new(Placement::Fixed(0))
+        .preempt_timer(Duration::from_millis(10))
+        .record_io_latencies(true)
         .spawn(|| async move {
             let filename = match std::env::var("GLOMMIO_TEST_POLLIO_ROOTDIR") {
                 Ok(path) => {
@@ -95,13 +98,14 @@ fn main() {
 }
 
 async fn run_io(name: &str, file: &ImmutableFile, count: usize, size: usize) {
+    let _ = executor().io_stats();
     let blocks = file.file_size() / size as u64 - 1;
     let hist = Rc::new(RefCell::new(
         hdrhistogram::Histogram::<u64>::new(4).unwrap(),
     ));
     let started_at = Instant::now();
 
-    let tasks: Vec<_> = (0..2 << 10)
+    let tasks: Vec<_> = (0..(2 << 10))
         .into_iter()
         .map(|_| {
             let file = file.clone();
@@ -128,13 +132,13 @@ async fn run_io(name: &str, file: &ImmutableFile, count: usize, size: usize) {
     println!("\n --- {} ---", name);
     println!(
         "performed {}k read IO at {}k IOPS (took {:.2}s)",
-        count / 1_000,
+        hist.len() / 1_000,
         ((count as f64 / started_at.elapsed().as_secs_f64()) / 1_000f64) as usize,
         started_at.elapsed().as_secs_f64()
     );
     println!(
-        "[measured] lat (end-to-end):\t\t\t\t\t\tmin: {: >4}us\tp50: {: >4}us\tp99: {: \
-         >4}us\tp99.9: {: >4}us\tp99.99: {: >4}us\tp99.999: {: >4}us\t max: {: >4}us",
+        "[measured] lat (end-to-end):\t\tmin: {: >4}us\tp50: {: >4}us\tp99: {: >4}us\tp99.9: {: \
+         >4}us\tp99.99: {: >4}us\tp99.999: {: >4}us\t max: {: >4}us, mean: {: >4}us",
         Duration::from_micros(hist.min()).as_micros(),
         Duration::from_micros(hist.value_at_quantile(0.5)).as_micros(),
         Duration::from_micros(hist.value_at_quantile(0.99)).as_micros(),
@@ -142,5 +146,20 @@ async fn run_io(name: &str, file: &ImmutableFile, count: usize, size: usize) {
         Duration::from_micros(hist.value_at_quantile(0.9999)).as_micros(),
         Duration::from_micros(hist.value_at_quantile(0.99999)).as_micros(),
         Duration::from_micros(hist.max()).as_micros(),
+        Duration::from_micros(hist.mean() as u64).as_micros(),
+    );
+
+    let io_stats = executor().io_stats().all_rings();
+    let io_lat = io_stats.io_latency_us();
+    println!(
+        "[measured] lat (kernel):\t\t\tmin: {: >4}us\tp50: {: >4}us\tp99: {: >4}us\tp99.9: {: \
+         >4}us\tp99.99: {: >4}us\tp99.999: {: >4}us\t max: {: >4}us",
+        Duration::from_micros(io_lat.min().unwrap() as u64).as_micros(),
+        Duration::from_micros(io_lat.quantile(0.5).unwrap().unwrap() as u64).as_micros(),
+        Duration::from_micros(io_lat.quantile(0.99).unwrap().unwrap() as u64).as_micros(),
+        Duration::from_micros(io_lat.quantile(0.999).unwrap().unwrap() as u64).as_micros(),
+        Duration::from_micros(io_lat.quantile(0.9999).unwrap().unwrap() as u64).as_micros(),
+        Duration::from_micros(io_lat.quantile(0.99999).unwrap().unwrap() as u64).as_micros(),
+        Duration::from_micros(io_lat.max().unwrap() as u64).as_micros(),
     );
 }
