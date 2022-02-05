@@ -19,6 +19,7 @@ use nix::{
     poll::PollFlags,
     sys::{socket::MsgFlags, stat::Mode},
 };
+use smallvec::SmallVec;
 
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the MIT/Apache-2.0 License, at your convenience
@@ -117,6 +118,57 @@ pub(crate) enum SourceStatus {
     Canceled,
 }
 
+pub(crate) type SourceCallback = Box<dyn FnOnce(&mut InnerSource)>;
+
+#[derive(Default)]
+pub(crate) struct CallbackVector(SmallVec<[SourceCallback; 1]>);
+
+impl CallbackVector {
+    pub(crate) fn raise(self, src: &mut InnerSource) {
+        for x in self.0 {
+            x(src);
+        }
+    }
+
+    pub(crate) fn add(&mut self, callback: SourceCallback) {
+        self.0.push(callback);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Callbacks {
+    /// A list of callback invoked when the source is added to a scheduler's
+    /// queue
+    pub(crate) queued: CallbackVector,
+
+    /// A list of callback invoked when the source dispatched to the kernel
+    pub(crate) submitted: CallbackVector,
+
+    /// A list of callbacks invoked when the source's result is available'
+    pub(crate) fulfilled: CallbackVector,
+
+    /// A list of callback invoked when the source's result is consumed
+    pub(crate) consumed: CallbackVector,
+}
+
+impl Callbacks {
+    pub(crate) fn queued(&mut self) -> CallbackVector {
+        std::mem::take(&mut self.queued)
+    }
+
+    pub(crate) fn submitted(&mut self) -> CallbackVector {
+        std::mem::take(&mut self.submitted)
+    }
+
+    pub(crate) fn fulfilled(&mut self) -> CallbackVector {
+        std::mem::take(&mut self.fulfilled)
+    }
+
+    pub(crate) fn consumed(&mut self) -> CallbackVector {
+        std::mem::take(&mut self.consumed)
+    }
+}
+
 pub(crate) type StatsCollectionFn = fn(&io::Result<usize>, &mut RingIoStats, waiters: u64) -> ();
 pub(crate) type LatencyCollectionFn =
     fn(std::time::Duration, std::time::Duration, std::time::Duration, &mut RingIoStats) -> ();
@@ -151,6 +203,8 @@ pub(crate) struct InnerSource {
     pub(crate) stats_collection: Option<StatsCollection>,
 
     pub(crate) task_queue: Option<TaskQueueHandle>,
+
+    pub(crate) callbacks: Callbacks,
 }
 
 impl InnerSource {
@@ -168,6 +222,7 @@ impl InnerSource {
             timeout: None,
             stats_collection,
             task_queue,
+            callbacks: Default::default(),
         })))
     }
 
@@ -251,6 +306,8 @@ impl Source {
         if ret.is_none() {
             return ret;
         }
+
+        inner.callbacks.consumed().raise(&mut *inner);
 
         // if there is a scheduler latency collection function present, invoke it once
         if let Some(Some(stat_fn)) = inner.stats_collection.as_ref().map(|x| x.latency) {

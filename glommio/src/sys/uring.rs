@@ -362,9 +362,8 @@ where
         }
 
         let src = source_map.consume_source(from_user_data(value.user_data()));
-        source_map.scheduler.borrow_mut().mark_completed(&src);
-
         let mut inner_source = src.borrow_mut();
+        inner_source.callbacks.fulfilled().raise(&mut *inner_source);
         inner_source.wakers.result = Some(post_process(
             &mut *inner_source,
             transmute_error(value.result()),
@@ -536,6 +535,7 @@ impl internal::Uring for PollRing {
                 if let Some(SourceStatus::Canceled) = x.status {
                     return Some(true);
                 }
+                x.callbacks.submitted().raise(&mut *x);
                 drop(x);
 
                 // we are golden
@@ -676,6 +676,7 @@ impl internal::Uring for SleepableRing {
                 if let Some(SourceStatus::Canceled) = x.status {
                     return Some(true);
                 }
+                x.callbacks.submitted().raise(&mut *x);
                 drop(x);
 
                 // we are golden
@@ -1460,9 +1461,12 @@ impl Reactor {
     }
 
     fn schedule_source(&self, source: &Source) {
-        source.inner.borrow_mut().wakers.queued_at = Some(Instant::now());
         let mut queue = self.scheduler.borrow_mut();
         queue.schedule(source.inner.clone());
+
+        let mut inner_source = source.inner.borrow_mut();
+        inner_source.wakers.queued_at = Some(Instant::now());
+        inner_source.callbacks.queued().raise(&mut *inner_source);
     }
 }
 

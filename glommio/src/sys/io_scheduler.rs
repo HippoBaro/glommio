@@ -87,9 +87,6 @@ pub(crate) trait IOScheduler: internal::IOSchedulerPrivate {
     /// blocking.
     fn schedule_emergency(&mut self, src: PinnedInnerSource);
 
-    /// Callback from the reactor once a request has been fulfilled
-    fn mark_completed(&mut self, _: &PinnedInnerSource);
-
     /// Create a scheduler session
     /// A session is needed to pop and peek inside the scheduler.
     fn open_session(&mut self) -> IOSchedulerSession<'_>;
@@ -160,10 +157,6 @@ impl IOScheduler for FIFOScheduler {
 
     fn schedule_emergency(&mut self, src: PinnedInnerSource) {
         self.emergency.push(src);
-    }
-
-    fn mark_completed(&mut self, _: &PinnedInnerSource) {
-        // doesn't do anything for now
     }
 
     fn open_session(&mut self) -> IOSchedulerSession<'_> {
