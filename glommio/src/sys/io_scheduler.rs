@@ -7,7 +7,8 @@ use crate::{
     },
     IoRequirements,
 };
-use std::collections::VecDeque;
+use alloc::rc::Rc;
+use std::{cell::Cell, collections::VecDeque};
 
 /// A queue for operations waiting to be submitted to the kernel
 pub(super) trait IOSchedulerQueue {
@@ -15,7 +16,7 @@ pub(super) trait IOSchedulerQueue {
     fn len(&self) -> usize;
     fn push(&mut self, src: PinnedInnerSource);
     fn pop(&mut self) -> Option<PinnedInnerSource>;
-    fn peek(&self) -> Option<&PinnedInnerSource>;
+    fn peek(&mut self) -> Option<&PinnedInnerSource>;
 }
 
 /// A simple FIFO queue
@@ -49,8 +50,138 @@ impl IOSchedulerQueue for FIFOQueue {
         self.inner.pop_front()
     }
 
-    fn peek(&self) -> Option<&PinnedInnerSource> {
+    fn peek(&mut self) -> Option<&PinnedInnerSource> {
         self.inner.front()
+    }
+}
+
+/// A queue that separate block IO requests and rate limit them
+pub(super) struct RateLimitingQueue {
+    queue: FIFOQueue,
+    limit: usize,
+    cur_inflight: Rc<Cell<usize>>,
+}
+
+impl RateLimitingQueue {
+    pub(super) fn new(capacity: usize, limit: usize) -> Self {
+        Self {
+            queue: FIFOQueue::with_capacity(capacity),
+            limit,
+            cur_inflight: Default::default(),
+        }
+    }
+}
+
+impl IOSchedulerQueue for RateLimitingQueue {
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn push(&mut self, src: PinnedInnerSource) {
+        self.queue.push(src)
+    }
+
+    fn pop(&mut self) -> Option<PinnedInnerSource> {
+        let ret = if self.cur_inflight.get() < self.limit {
+            self.queue.pop()
+        } else {
+            None
+        };
+
+        if let Some(p) = ret {
+            let cu = self.cur_inflight.clone();
+            cu.replace(cu.take() + 1);
+            p.borrow_mut().callbacks.fulfilled.add(Box::new(move |_| {
+                cu.replace(cu.take() - 1);
+            }));
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    fn peek(&mut self) -> Option<&PinnedInnerSource> {
+        if self.cur_inflight.get() < self.limit {
+            self.queue.peek()
+        } else {
+            None
+        }
+    }
+}
+
+/// A queue that separate block IO requests and rate limit them
+pub(super) struct BlockIORateLimitingQueue {
+    io: RateLimitingQueue,
+    other: FIFOQueue,
+    next_is_io: bool,
+}
+
+impl BlockIORateLimitingQueue {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            io: RateLimitingQueue::new(capacity, usize::MAX),
+            other: FIFOQueue::with_capacity(capacity),
+            next_is_io: true,
+        }
+    }
+}
+
+impl IOSchedulerQueue for BlockIORateLimitingQueue {
+    fn is_empty(&self) -> bool {
+        self.io.is_empty() && self.other.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.io.len() + self.other.len()
+    }
+
+    fn push(&mut self, src: PinnedInnerSource) {
+        let is_block_io = matches!(
+            src.borrow().source_type,
+            SourceType::Read(..) | SourceType::Write(..)
+        );
+
+        if is_block_io {
+            self.io.push(src)
+        } else {
+            self.other.push(src)
+        }
+    }
+
+    fn pop(&mut self) -> Option<PinnedInnerSource> {
+        if self.next_is_io {
+            if let Some(p) = self.io.pop() {
+                self.next_is_io = false;
+                Some(p)
+            } else {
+                self.other.pop()
+            }
+        } else if let Some(p) = self.other.pop() {
+            self.next_is_io = true;
+            Some(p)
+        } else {
+            self.io.pop()
+        }
+    }
+
+    fn peek(&mut self) -> Option<&PinnedInnerSource> {
+        if self.next_is_io {
+            if let Some(p) = self.io.peek() {
+                self.next_is_io = false;
+                Some(p)
+            } else {
+                self.other.peek()
+            }
+        } else if let Some(p) = self.other.peek() {
+            self.next_is_io = true;
+            Some(p)
+        } else {
+            self.io.peek()
+        }
     }
 }
 
@@ -60,7 +191,7 @@ mod internal {
     pub(crate) trait IOSchedulerPrivate {
         /// Peek into the next source, if any
         /// Return true is the source is an emergency
-        fn peek(&self) -> Option<(&PinnedInnerSource, bool)>;
+        fn peek(&mut self) -> Option<(&PinnedInnerSource, bool)>;
 
         /// Pop the next source, if any
         /// Return true is the source is an emergency
@@ -94,11 +225,10 @@ pub(crate) trait IOScheduler: internal::IOSchedulerPrivate {
 
 /// A FIFO scheduler that doesn't prioritize any requests except for
 /// cancellations
-#[derive(Debug, Default)]
 pub(crate) struct FIFOScheduler {
     emergency: FIFOQueue,
     cancellations: FIFOQueue,
-    submissions: FIFOQueue,
+    submissions: BlockIORateLimitingQueue,
 }
 
 impl FIFOScheduler {
@@ -106,13 +236,13 @@ impl FIFOScheduler {
         Self {
             emergency: FIFOQueue::with_capacity(8),
             cancellations: FIFOQueue::with_capacity(capacity),
-            submissions: FIFOQueue::with_capacity(capacity),
+            submissions: BlockIORateLimitingQueue::with_capacity(capacity),
         }
     }
 }
 
 impl IOSchedulerPrivate for FIFOScheduler {
-    fn peek(&self) -> Option<(&PinnedInnerSource, bool)> {
+    fn peek(&mut self) -> Option<(&PinnedInnerSource, bool)> {
         if let Some(x) = self.emergency.peek() {
             Some((x, true))
         } else if let Some(x) = self.cancellations.peek() {
@@ -199,13 +329,14 @@ impl<'a> Drop for IOSchedulerSession<'a> {
 }
 
 impl<'a> IOSchedulerSession<'a> {
-    pub(super) fn peek(&self) -> Option<&PinnedInnerSource> {
+    pub(super) fn peek(&mut self) -> Option<&PinnedInnerSource> {
+        let should_drain = self.should_drain;
         self.sched
             .peek()
             .filter(|(_, emergency)| {
                 // the last source yielded was an emergency. The reactor
                 // should be drained first!
-                *emergency || !self.should_drain
+                *emergency || !should_drain
             })
             .map(|(s, _)| s)
     }
