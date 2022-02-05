@@ -148,11 +148,11 @@ impl DmaFile {
 
         // Docker overlay can show as dev_major 0.
         // Anything like that is obviously not something that supports the poll ring.
-        if file.dev_major == 0
-            || sysfs::BlockDevice::is_md(file.dev_major as _, file.dev_minor as _)
-        {
-            pollable = PollableStatus::NonPollable(DirectIo::Enabled);
-        }
+        // if file.dev_major == 0
+        //     || sysfs::BlockDevice::is_md(file.dev_major as _, file.dev_minor as _)
+        // {
+        pollable = PollableStatus::NonPollable(DirectIo::Enabled);
+        // }
         let max_sectors_size =
             sysfs::BlockDevice::max_sectors_size(file.dev_major as _, file.dev_minor as _);
         let max_segment_size =
