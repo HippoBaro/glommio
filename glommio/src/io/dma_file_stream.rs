@@ -625,6 +625,23 @@ pub struct DmaStreamWriterBuilder {
 }
 
 impl DmaStreamWriterBuilder {
+    /// Creates a new DmaStreamReaderBuilder, given a shared pointer to a
+    /// [`DmaFile`]
+    ///
+    /// This method is useful in situations where a shared pointer was already
+    /// present.
+    ///
+    /// Other than that, it is the same as [`new`]
+    #[must_use = "The builder must be built to be useful"]
+    pub fn from_rc(file: Rc<DmaFile>) -> DmaStreamWriterBuilder {
+        DmaStreamWriterBuilder {
+            buffer_size: 128 << 10,
+            write_behind: 4,
+            sync_on_close: true,
+            file,
+        }
+    }
+
     /// Creates a new DmaStreamWriterBuilder, given a [`DmaFile`]
     ///
     /// Various properties can be set by using its `with` methods.
